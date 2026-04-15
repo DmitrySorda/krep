@@ -80,7 +80,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "2.2.0"
+#define VERSION "2.3.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -412,6 +412,20 @@ size_t find_line_end(const char *text, size_t text_len, size_t pos)
     //     pos++;
     // }
     // return pos; // Returns index of '\n' or text_len if no newline found
+}
+
+// Advance an offset to the first position after the next newline.
+// If no newline is found, clamp to text_len.
+static size_t advance_to_next_line_boundary(const char *text, size_t text_len, size_t offset)
+{
+    if (offset >= text_len)
+        return text_len;
+
+    const char *newline_ptr = memchr(text + offset, '\n', text_len - offset);
+    if (newline_ptr == NULL)
+        return text_len;
+
+    return (size_t)(newline_ptr - text) + 1;
 }
 
 // --- Printing Function ---
@@ -1807,6 +1821,14 @@ search_func_t select_search_algorithm(const search_params_t *params)
     }
     else if (params->pattern_len < SHORT_PATTERN_THRESH)
     {
+        // For line-counting workloads on very short literals, the scalar memchr-based
+        // implementation is often faster than the SIMD path because it can skip an
+        // entire matching line with less setup overhead.
+        if (params->count_lines_mode)
+        {
+            return memchr_short_search;
+        }
+
         // For 2-3 character patterns, use our specialized short pattern search
         // SIMD might still be better for case-sensitive search on supported platforms
         if (can_use_simd && params->case_sensitive)
@@ -2828,6 +2850,7 @@ int search_file(const search_params_t *params, const char *filename, int request
         // For simplicity, we assume initial allocation was sufficient or handle errors later.
     }
 
+    const bool line_aligned_chunks = current_params.count_lines_mode;
     size_t current_pos = 0;
     int chunks_launched = 0;
     const int planned_thread_count = actual_thread_count;
@@ -2855,28 +2878,56 @@ int search_file(const search_params_t *params, const char *filename, int request
             break;
         }
 
-        size_t this_chunk_len = (current_pos + chunk_size_calc > file_size) ? (file_size - current_pos) : chunk_size_calc;
+        size_t chunk_start = current_pos;
+        size_t this_chunk_len = (chunk_start + chunk_size_calc > file_size) ? (file_size - chunk_start) : chunk_size_calc;
         if (this_chunk_len == 0)
             break;
 
-        // Overlap needed for literal patterns. Regex handled differently (often needs no overlap or different logic).
-        size_t overlap = (!current_params.use_regex && max_literal_pattern_len > 0 && i < planned_thread_count - 1) ? max_literal_pattern_len - 1 : 0;
-        size_t effective_chunk_len = (current_pos + this_chunk_len + overlap > file_size) ? (file_size - current_pos) : (this_chunk_len + overlap);
-
-        // Ensure chunk length isn't zero if there's still data
-        if (effective_chunk_len == 0 && current_pos < file_size)
+        size_t effective_chunk_len = 0;
+        if (line_aligned_chunks)
         {
-            effective_chunk_len = file_size - current_pos;
+            // For -c workloads, split the file on line boundaries so that each line
+            // is processed by exactly one worker. This makes counts exact across
+            // threads and avoids rescanning overlap bytes that cannot contribute to
+            // additional matching lines.
+            size_t chunk_end = chunk_start + this_chunk_len;
+            if (chunk_end > file_size)
+                chunk_end = file_size;
+
+            if (chunk_end < file_size && i < planned_thread_count - 1)
+            {
+                chunk_end = advance_to_next_line_boundary(file_data, file_size, chunk_end);
+            }
+
+            if (chunk_end < chunk_start)
+                chunk_end = file_size;
+
+            effective_chunk_len = chunk_end - chunk_start;
+            current_pos = chunk_end;
+        }
+        else
+        {
+            // Overlap needed for literal patterns. Regex handled differently (often
+            // needs no overlap or different logic).
+            size_t overlap = (!current_params.use_regex && max_literal_pattern_len > 0 && i < planned_thread_count - 1) ? max_literal_pattern_len - 1 : 0;
+            effective_chunk_len = (chunk_start + this_chunk_len + overlap > file_size) ? (file_size - chunk_start) : (this_chunk_len + overlap);
+            current_pos = chunk_start + this_chunk_len; // Advance by non-overlapped length
         }
 
-        current_pos += this_chunk_len; // Advance by non-overlapped length
+        // Ensure chunk length isn't zero if there's still data
+        if (effective_chunk_len == 0 && chunk_start < file_size)
+        {
+            effective_chunk_len = file_size - chunk_start;
+            current_pos = file_size;
+        }
+
         if (effective_chunk_len == 0)
             continue;
 
         thread_data_t *slot = &thread_args[chunks_launched];
         slot->thread_id = chunks_launched;
         slot->params = &current_params; // Pass params containing the pre-built trie
-        slot->chunk_start = file_data + (current_pos - this_chunk_len);
+        slot->chunk_start = file_data + chunk_start;
         slot->search_algo = preselected_algo;
         slot->chunk_len = effective_chunk_len;
         slot->local_result = NULL;
@@ -2949,7 +3000,8 @@ int search_file(const search_params_t *params, const char *filename, int request
         // Always process results from thread_args, regardless of how the thread was executed
         if (result_code != 2 && !merge_error)
         {
-            // Sum counts (lines or matches). Note: Line count might be slightly off at boundaries.
+            // Sum counts from disjoint chunks. In -c mode chunks are line-aligned,
+            // so each matching line belongs to exactly one worker.
             uint64_t thread_count = thread_args[i].count_result;
             if (max_count != SIZE_MAX)
             {

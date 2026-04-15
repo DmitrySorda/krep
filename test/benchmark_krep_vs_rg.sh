@@ -4,9 +4,10 @@ set -euo pipefail
 DATASET_URL="https://burntsushi.net/stuff/subtitles2016-sample.en.gz"
 DATASET_GZ="subtitles2016-sample.en.gz"
 DATASET_TXT="subtitles2016-sample.en"
-RUNS="${RUNS:-5}"
+RUNS="${RUNS:-7}"
 PATTERN="${1:-the}"
 KREP_BIN="${KREP_BIN:-./krep}"
+GREP_BIN="${GREP_BIN:-grep}"
 
 measure_cmd_avg() {
   local runs="$1"
@@ -30,6 +31,11 @@ measure_cmd_avg() {
 
 if ! command -v rg >/dev/null 2>&1; then
   echo "ripgrep (rg) is not installed or not in PATH." >&2
+  exit 1
+fi
+
+if ! command -v "${GREP_BIN}" >/dev/null 2>&1; then
+  echo "grep is not installed or not in PATH." >&2
   exit 1
 fi
 
@@ -62,19 +68,28 @@ fi
 # Warm cache.
 "${KREP_BIN}" -c -F -- "${PATTERN}" "${DATASET_TXT}" >/dev/null
 rg -c -F -- "${PATTERN}" "${DATASET_TXT}" >/dev/null
+"${GREP_BIN}" -c -F -- "${PATTERN}" "${DATASET_TXT}" >/dev/null
 
 krep_count="$("${KREP_BIN}" -c -F -- "${PATTERN}" "${DATASET_TXT}" | awk -F: '{print $NF}')"
 rg_count="$(rg -c -F -- "${PATTERN}" "${DATASET_TXT}" | awk -F: '{print $NF}')"
+grep_count="$("${GREP_BIN}" -c -F -- "${PATTERN}" "${DATASET_TXT}" | awk -F: '{sum += $NF} END { print sum + 0 }')"
 
 if [[ "${krep_count}" != "${rg_count}" ]]; then
   echo "Count mismatch detected (krep=${krep_count}, rg=${rg_count})." >&2
   exit 1
 fi
 
+if [[ "${krep_count}" != "${grep_count}" ]]; then
+  echo "Count mismatch detected (krep=${krep_count}, grep=${grep_count})." >&2
+  exit 1
+fi
+
 krep_avg="$(measure_cmd_avg "${RUNS}" "${KREP_BIN}" -c -F -- "${PATTERN}" "${DATASET_TXT}")"
 rg_avg="$(measure_cmd_avg "${RUNS}" rg -c -F -- "${PATTERN}" "${DATASET_TXT}")"
+grep_avg="$(measure_cmd_avg "${RUNS}" "${GREP_BIN}" -c -F -- "${PATTERN}" "${DATASET_TXT}")"
 
 speedup="$(awk -v k="${krep_avg}" -v r="${rg_avg}" 'BEGIN { if (k > 0) printf "%.2f", r / k; else print "inf" }')"
+grep_speedup="$(awk -v k="${krep_avg}" -v g="${grep_avg}" 'BEGIN { if (k > 0) printf "%.2f", g / k; else print "inf" }')"
 
 printf "\nBenchmark (cached)\n"
 printf "Pattern: %s\n" "${PATTERN}"
@@ -83,5 +98,7 @@ printf "Runs: %s\n\n" "${RUNS}"
 printf "%-10s %12s\n" "Tool" "Avg real (s)"
 printf "%-10s %12s\n" "krep" "${krep_avg}"
 printf "%-10s %12s\n" "ripgrep" "${rg_avg}"
+printf "%-10s %12s\n" "grep" "${grep_avg}"
 printf "\nSpeedup (ripgrep/krep): %sx\n" "${speedup}"
+printf "Speedup (grep/krep): %sx\n" "${grep_speedup}"
 printf "Validated count: %s\n" "${krep_count}"

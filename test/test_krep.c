@@ -202,6 +202,92 @@ cleanup:
     return ok;
 }
 
+static bool run_search_file_only_matching_capture(const char *filepath,
+                                                  const char *pattern,
+                                                  int threads,
+                                                  uint64_t *line_count_out,
+                                                  int *exit_code_out)
+{
+    if (!filepath || !pattern || !line_count_out || !exit_code_out)
+        return false;
+
+    bool ok = false;
+    int saved_stdout = -1;
+    int out_fd = -1;
+    char out_template[] = "/tmp/krep_mt_only_outputXXXXXX";
+    char read_buffer[4096];
+    search_params_t params = create_literal_params(pattern, true, false, true);
+    uint64_t line_count = 0;
+
+    out_fd = mkstemp(out_template);
+    if (out_fd == -1)
+    {
+        perror("mkstemp failed for only-matching capture");
+        goto cleanup;
+    }
+
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout == -1)
+    {
+        perror("dup failed while capturing only-matching stdout");
+        goto cleanup;
+    }
+
+    fflush(stdout);
+    if (dup2(out_fd, STDOUT_FILENO) == -1)
+    {
+        perror("dup2 failed while redirecting only-matching stdout");
+        goto cleanup;
+    }
+
+    *exit_code_out = search_file(&params, filepath, threads);
+    fflush(stdout);
+
+    if (dup2(saved_stdout, STDOUT_FILENO) == -1)
+    {
+        perror("dup2 failed while restoring only-matching stdout");
+        goto cleanup;
+    }
+    close(saved_stdout);
+    saved_stdout = -1;
+
+    if (lseek(out_fd, 0, SEEK_SET) == -1)
+    {
+        perror("lseek failed for only-matching capture");
+        goto cleanup;
+    }
+
+    ssize_t n;
+    while ((n = read(out_fd, read_buffer, sizeof(read_buffer))) > 0)
+    {
+        for (ssize_t i = 0; i < n; ++i)
+        {
+            if (read_buffer[i] == '\n')
+                line_count++;
+        }
+    }
+    if (n < 0)
+    {
+        perror("read failed for only-matching capture");
+        goto cleanup;
+    }
+
+    *line_count_out = line_count;
+    ok = true;
+
+cleanup:
+    if (saved_stdout != -1)
+    {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    if (out_fd != -1)
+        close(out_fd);
+    unlink(out_template);
+    cleanup_params(&params);
+    return ok;
+}
+
 /* ========================================================================= */
 /* Common helper for both literal and regex params                          */
 /* ========================================================================= */
@@ -1105,6 +1191,43 @@ void test_multithreading_placeholder_new(void)
     unlink(temp_path);
 }
 
+void test_multithread_only_matching_consistency(void)
+{
+    printf("\n=== Testing Parallel Only-Matching Consistency ===\n");
+
+    const char *pattern = "FINDME_THREAD_TEST";
+    char temp_path[] = "/tmp/krep_mt_o_fileXXXXXX";
+    uint64_t expected_count = 0;
+    uint64_t count_single = 0;
+    uint64_t count_multi = 0;
+    int rc_single = -1;
+    int rc_multi = -1;
+
+    bool file_ok = write_multithread_test_file(temp_path, pattern, &expected_count);
+    TEST_ASSERT(file_ok, "Create large temp file for multithread -o consistency");
+    if (!file_ok)
+        return;
+
+    bool single_ok = run_search_file_only_matching_capture(temp_path, pattern, 1, &count_single, &rc_single);
+    TEST_ASSERT(single_ok, "Single-threaded -o capture works");
+
+    bool multi_ok = run_search_file_only_matching_capture(temp_path, pattern, 8, &count_multi, &rc_multi);
+    TEST_ASSERT(multi_ok, "Multi-threaded -o capture works");
+
+    if (single_ok)
+        TEST_ASSERT(rc_single == 0, "Single-threaded -o search_file returns match found");
+    if (multi_ok)
+        TEST_ASSERT(rc_multi == 0, "Multi-threaded -o search_file returns match found");
+    if (single_ok)
+        TEST_ASSERT(count_single == expected_count, "Single-threaded -o output count matches expected value");
+    if (multi_ok)
+        TEST_ASSERT(count_multi == expected_count, "Multi-threaded -o output count matches expected value");
+    if (single_ok && multi_ok)
+        TEST_ASSERT(count_single == count_multi, "Single-thread and multi-thread -o output counts are identical");
+
+    unlink(temp_path);
+}
+
 /**
  * Test numeric patterns using the new structure
  */
@@ -1499,6 +1622,7 @@ int main(void)
     test_report_limit_new();
     test_max_count_new(); // Add call to the new test function
     test_multithreading_placeholder_new();
+    test_multithread_only_matching_consistency();
 
     // Add additional edge case tests
     test_additional_cases();

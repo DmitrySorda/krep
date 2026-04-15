@@ -1,12 +1,12 @@
 # krep - A high-performance string search utility
 # Author: Davide Santangelo
-# Version: 2.2.0
+# Version: 2.3.0
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O3 -ffast-math -std=c11 -pthread -D_GNU_SOURCE -D_DEFAULT_SOURCE \
+CFLAGS = -Wall -Wextra -O3 -std=c11 -pthread -D_GNU_SOURCE -D_DEFAULT_SOURCE \
          -flto -funroll-loops -finline-functions
 LDFLAGS = -pthread -flto
 

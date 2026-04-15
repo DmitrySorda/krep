@@ -1,6 +1,6 @@
 # k(r)ep - A high-performance string search utility
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Version](https://img.shields.io/badge/version-2.3.0-blue)
 ![License](https://img.shields.io/badge/license-BSD-green)
 
 `krep` is an optimized string search utility designed for maximum throughput and efficiency when processing large files and directories. It is built with performance in mind, offering multiple search algorithms and SIMD acceleration when available.
@@ -168,14 +168,14 @@ make bench-rg
 # optional: RUNS=7 bash test/benchmark_krep_vs_rg.sh Sherlock
 ```
 
-### krep vs ripgrep (warm cache, 7 runs average baseline)
+### krep vs ripgrep / grep (warm cache, 7 runs average baseline)
 
-| Pattern | krep avg real (s) | ripgrep avg real (s) | Speedup |
-| --- | ---: | ---: | ---: |
-| `the` | 0.175714 | 0.330000 | 1.88x |
-| `Sherlock` | 0.041429 | 0.080000 | 1.93x |
+| Pattern | krep avg real (s) | ripgrep avg real (s) | GNU grep real (s) | krep vs rg | krep vs grep |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `the` | 0.132857 | 0.318571 | 4.848571 | 2.40x | 36.49x |
+| `Sherlock` | 0.031429 | 0.080000 | 2.777143 | 2.55x | 88.36x |
 
-_Measured on macOS ARM64 with `test/benchmark_krep_vs_rg.sh`. Results vary by CPU, storage and cache state._
+_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 2.3.0 improves the hot `-c -F` path by preferring the short literal scalar fast path for 2-3 byte patterns and by splitting multi-threaded count workloads on newline boundaries, eliminating boundary over-count risk while reducing overlap overhead. Results vary by CPU, storage and cache state._
 
 ## How Krep Works
 

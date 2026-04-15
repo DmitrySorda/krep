@@ -1,6 +1,8 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
 
 jobs:
   build:
@@ -15,9 +17,30 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+      - name: Show toolchain
+        run: |
+          cc --version || true
+          make --version || true
       - name: Build
         run: make -j
       - name: Run Unit Tests
         run: make test
       - name: Run Directory Integration Tests
         run: make test-directory
+      - name: Ensure ripgrep is available
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+      - name: Benchmark smoke test
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
+          gzip -dkf subtitles2016-sample.en.gz
+          RUNS=1 bash test/benchmark_krep_vs_rg.sh Sherlock

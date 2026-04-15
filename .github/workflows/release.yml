@@ -30,6 +30,34 @@ jobs:
       - name: Run tests
         run: make test && make test-directory
 
+      - name: Ensure ripgrep is available
+        shell: bash
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y ripgrep
+              ;;
+            macOS)
+              brew install ripgrep
+              ;;
+            *)
+              echo "Unsupported runner OS: ${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Benchmark smoke test
+        shell: bash
+        run: |
+          curl -LO 'https://burntsushi.net/stuff/subtitles2016-sample.en.gz'
+          gzip -dkf subtitles2016-sample.en.gz
+          RUNS=1 bash test/benchmark_krep_vs_rg.sh Sherlock
+
       - name: Package binary
         run: |
           mkdir -p dist
