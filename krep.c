@@ -4854,13 +4854,14 @@ uint64_t simd_sse42_search(const search_params_t *params,
         __m128i first_cmp = _mm_cmpeq_epi8(first_text, first_vec);
         __m128i last_cmp = _mm_cmpeq_epi8(last_text, last_vec);
         uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_and_si128(first_cmp, last_cmp));
+        // Avoid shifting by 16: the full-width candidate mask is already correct.
         if (candidate_count < 16)
             mask &= (1u << candidate_count) - 1u;
 
         while (mask != 0)
         {
             int index = __builtin_ctz(mask);
-            mask &= mask - 1;
+            mask = mask & (mask - 1);
 
             if (memcmp(current_pos + index, pattern, pattern_len) != 0)
                 continue;

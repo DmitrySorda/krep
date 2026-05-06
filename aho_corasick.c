@@ -93,6 +93,8 @@ static bool ac_node_set_child(ac_node_t *node, unsigned char c, ac_node_t *child
         if (node->capacity_children > INT_MAX / 2)
             return false;
         int new_capacity = node->capacity_children == 0 ? 4 : node->capacity_children * 2;
+        if ((size_t)new_capacity > SIZE_MAX / sizeof(ac_edge_t))
+            return false;
         ac_edge_t *new_children = realloc(node->children, (size_t)new_capacity * sizeof(ac_edge_t));
         if (!new_children)
         {
