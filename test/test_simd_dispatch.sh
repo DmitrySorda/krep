@@ -55,7 +55,7 @@ PY
 
 simd_avg="$(measure_avg "${KREP_BIN}" -c -F -- "${PATTERN}" "${DATASET}")"
 nosimd_avg="$(measure_avg "${KREP_BIN}" --no-simd -c -F -- "${PATTERN}" "${DATASET}")"
-ratio="$(awk -v s="${simd_avg}" -v n="${nosimd_avg}" 'BEGIN { if (s > 0) printf "%.2f", n / s; else print "inf" }')"
+ratio="$(awk -v s="${simd_avg}" -v n="${nosimd_avg}" 'BEGIN { if (s > 0) printf "%.2f", n / s; else if (n > 0) print "inf"; else print "1.00" }')"
 verdict="$(awk -v s="${simd_avg}" -v n="${nosimd_avg}" 'BEGIN { print (s <= n) ? "better-or-equal" : "worse" }')"
 
 printf "SIMD dispatch smoke test\n"

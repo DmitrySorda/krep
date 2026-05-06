@@ -143,7 +143,8 @@ static bool cpu_supports_avx512bw(void)
 #endif
 }
 
-static size_t KREP_UNUSED runtime_simd_max_pattern_len(void)
+#if !defined(TESTING)
+static size_t runtime_simd_max_pattern_len(void)
 {
     if (force_no_simd)
         return 0;
@@ -159,6 +160,7 @@ static size_t KREP_UNUSED runtime_simd_max_pattern_len(void)
     return 0;
 #endif
 }
+#endif
 
 // Global lookup table for fast lowercasing
 unsigned char lower_table[256]; // Remove static
@@ -4796,7 +4798,7 @@ end_neon_search:
 // --- SIMD Implementations (Placeholders/Actual) ---
 
 #if KREP_USE_SSE42
-// SSE-compatible byte-mask search function.
+// Legacy simd_sse42_search entry point implemented with SSE2 byte masks.
 // Handles case-sensitive patterns up to 16 bytes without SSE4.2 cmpestri.
 uint64_t simd_sse42_search(const search_params_t *params,
                             const char *text_start,
@@ -4848,8 +4850,10 @@ uint64_t simd_sse42_search(const search_params_t *params,
             last_text = _mm_loadu_si128((const __m128i *)last_buf);
         }
 
-        uint32_t mask = (uint32_t)(_mm_movemask_epi8(_mm_cmpeq_epi8(first_text, first_vec)) &
-                                   _mm_movemask_epi8(_mm_cmpeq_epi8(last_text, last_vec)));
+        bool line_skipped = false;
+        __m128i first_cmp = _mm_cmpeq_epi8(first_text, first_vec);
+        __m128i last_cmp = _mm_cmpeq_epi8(last_text, last_vec);
+        uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_and_si128(first_cmp, last_cmp));
         if (candidate_count < 16)
             mask &= (1u << candidate_count) - 1u;
 
@@ -4890,7 +4894,8 @@ uint64_t simd_sse42_search(const search_params_t *params,
                             advance = remaining_len;
                         current_pos += advance;
                         remaining_len -= advance;
-                        goto next_sse_window;
+                        line_skipped = true;
+                        break;
                     }
                 }
             }
@@ -4924,9 +4929,11 @@ uint64_t simd_sse42_search(const search_params_t *params,
                 return current_count;
         }
 
+        if (line_skipped)
+            continue;
+
         current_pos += candidate_count;
         remaining_len -= candidate_count;
-    next_sse_window:;
     }
 
     return current_count;
