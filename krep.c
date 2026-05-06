@@ -47,7 +47,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
 #include <immintrin.h>
 #define KREP_X86_64 1
-#define KREP_USE_SSE42 1  // Legacy name; implementation uses baseline SSE2 byte masks.
+#define KREP_USE_SSE2 1
 #if defined(__GNUC__) || defined(__clang__)
 #define KREP_USE_AVX2 1
 #define KREP_USE_AVX512 1
@@ -63,7 +63,7 @@ static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *),
 #define KREP_X86_64 0
 #define KREP_USE_AVX512 0
 #define KREP_USE_AVX2 0
-#define KREP_USE_SSE42 0
+#define KREP_USE_SSE2 0
 #define KREP_TARGET_AVX2
 #define KREP_TARGET_AVX512
 #endif
@@ -106,7 +106,7 @@ const size_t SIMD_MAX_PATTERN_LEN = 64;
 #elif KREP_USE_AVX2
 // AVX2 implementation handles <= 32 bytes.
 const size_t SIMD_MAX_PATTERN_LEN = 32;
-#elif KREP_USE_SSE42
+#elif KREP_USE_SSE2
 const size_t SIMD_MAX_PATTERN_LEN = 16;
 #elif KREP_USE_NEON
 const size_t SIMD_MAX_PATTERN_LEN = 16;
@@ -152,7 +152,7 @@ static size_t runtime_simd_max_pattern_len(void)
         return 64;
     if (cpu_supports_avx2())
         return 32;
-#if KREP_USE_SSE42
+#if KREP_USE_SSE2
     return 16;
 #elif KREP_USE_NEON
     return 16;
@@ -1886,10 +1886,10 @@ search_func_t select_search_algorithm(const search_params_t *params)
         if (can_use_avx2 && params->pattern_len <= 32 && params->case_sensitive)
             return simd_avx2_search;
 #endif
-#if KREP_USE_SSE42
+#if KREP_USE_SSE2
         // Baseline SSE2 byte-mask path supports case-sensitive patterns up to 16 bytes.
         if (params->pattern_len <= 16 && params->case_sensitive)
-            return simd_sse42_search;
+            return simd_sse2_search;
 #endif
 #if KREP_USE_NEON
         // NEON supports case-sensitive for any length (using first-byte filter)
@@ -2017,8 +2017,8 @@ const char *get_algorithm_name(search_func_t func)
         return "memchr";
     else if (func == memchr_short_search)
         return "memchr-short";
-#if KREP_USE_SSE42
-    else if (func == simd_sse42_search)
+#if KREP_USE_SSE2
+    else if (func == simd_sse2_search)
         return "SSE2";
 #endif
 #if KREP_USE_AVX2
@@ -4070,7 +4070,7 @@ uint64_t memchr_search(const search_params_t *params,
                     }
                     else if (!match_result_add(result, match_pos, match_pos + 1))
                     {
-                        fprintf(stderr, "Warning: Failed to add SSE4.2 match position.\n");
+                        fprintf(stderr, "Warning: Failed to add SSE2 match position.\n");
                     }
                 }
                 break; // Limit reached
@@ -4797,10 +4797,10 @@ end_neon_search:
 
 // --- SIMD Implementations (Placeholders/Actual) ---
 
-#if KREP_USE_SSE42
-// Legacy simd_sse42_search entry point implemented with SSE2 byte masks.
-// Handles case-sensitive patterns up to 16 bytes without SSE4.2 cmpestri.
-uint64_t simd_sse42_search(const search_params_t *params,
+#if KREP_USE_SSE2
+// Legacy simd_sse2_search entry point implemented with SSE2 byte masks.
+// Handles case-sensitive patterns up to 16 bytes without SSE2 cmpestri.
+uint64_t simd_sse2_search(const search_params_t *params,
                             const char *text_start,
                             size_t text_len,
                             match_result_t *result)
@@ -4944,7 +4944,7 @@ uint64_t simd_sse42_search(const search_params_t *params,
 #if KREP_USE_AVX2
 // AVX2 search function
 // Handles case-sensitive patterns up to 32 bytes.
-// Uses SSE4.2 logic for patterns <= 16 bytes.
+// Uses SSE2 logic for patterns <= 16 bytes.
 // Uses a simplified first/last byte check for patterns > 16 bytes.
 KREP_TARGET_AVX2 uint64_t simd_avx2_search(const search_params_t *params,
                                            const char *text_start,
@@ -4959,11 +4959,11 @@ KREP_TARGET_AVX2 uint64_t simd_avx2_search(const search_params_t *params,
     if (params->max_count == 0 && (params->count_lines_mode || params->track_positions))
         return 0;
 
-    // Use SSE4.2 logic if pattern fits and SSE4.2 is available
-#if KREP_USE_SSE42
+    // Use SSE2 logic if pattern fits and SSE2 is available
+#if KREP_USE_SSE2
     if (params->pattern_len <= 16)
     {
-        return simd_sse42_search(params, text_start, text_len, result);
+        return simd_sse2_search(params, text_start, text_len, result);
     }
 #endif
 

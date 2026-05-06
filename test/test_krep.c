@@ -440,21 +440,21 @@ void test_basic_search_new(void)
                 "KMP doesn't find 'cat'");
     cleanup_params(&kmp_params_cat);
 
-// --- SSE4.2 Tests (if available) ---
-#if KREP_USE_SSE42
+// --- SSE2 Tests (if available) ---
+#if KREP_USE_SSE2
     search_params_t sse_params_quick = create_literal_params("quick", true, false, false);
-    TEST_ASSERT(simd_sse42_search(&sse_params_quick, haystack, haystack_len, result) == 1,
-                "SSE4.2 finds 'quick' once");
+    TEST_ASSERT(simd_sse2_search(&sse_params_quick, haystack, haystack_len, result) == 1,
+                "SSE2 finds 'quick' once");
     cleanup_params(&sse_params_quick);
 
     search_params_t sse_params_fox = create_literal_params("fox", true, false, false);
-    TEST_ASSERT(simd_sse42_search(&sse_params_fox, haystack, haystack_len, result) == 1,
-                "SSE4.2 finds 'fox' once");
+    TEST_ASSERT(simd_sse2_search(&sse_params_fox, haystack, haystack_len, result) == 1,
+                "SSE2 finds 'fox' once");
     cleanup_params(&sse_params_fox);
 
     search_params_t sse_params_cat = create_literal_params("cat", true, false, false);
-    TEST_ASSERT(simd_sse42_search(&sse_params_cat, haystack, haystack_len, result) == 0,
-                "SSE4.2 doesn't find 'cat'");
+    TEST_ASSERT(simd_sse2_search(&sse_params_cat, haystack, haystack_len, result) == 0,
+                "SSE2 doesn't find 'cat'");
     cleanup_params(&sse_params_cat);
 #endif
 }
@@ -482,9 +482,9 @@ void test_edge_cases_new(void)
                 "KMP finds 17 occurrences of 'a'");
     TEST_ASSERT(test_bridge_boyer_moore(&params_a, haystack_a, len_a, result) == 17,
                 "BM finds 17 occurrences of 'a'");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params_a, haystack_a, len_a, result) == 17,
-                "SSE4.2 finds 17 occurrences of 'a'");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params_a, haystack_a, len_a, result) == 17,
+                "SSE2 finds 17 occurrences of 'a'");
 #endif
     cleanup_params(&params_a);
 
@@ -509,9 +509,9 @@ void test_edge_cases_new(void)
                 "Match at start is found (KMP)");
     TEST_ASSERT(test_bridge_boyer_moore(&params_abc, haystack_abc, len_abc, result) == 1,
                 "Match at start is found (BM)");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params_abc, haystack_abc, len_abc, result) == 1,
-                "Match at start is found (SSE4.2)");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params_abc, haystack_abc, len_abc, result) == 1,
+                "Match at start is found (SSE2)");
 #endif
     cleanup_params(&params_abc);
 
@@ -520,9 +520,9 @@ void test_edge_cases_new(void)
                 "Match at end is found (KMP)");
     TEST_ASSERT(test_bridge_boyer_moore(&params_def, haystack_abc, len_abc, result) == 1,
                 "Match at end is found (BM)");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params_def, haystack_abc, len_abc, result) == 1,
-                "Match at end is found (SSE4.2)");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params_def, haystack_abc, len_abc, result) == 1,
+                "Match at end is found (SSE2)");
 #endif
     cleanup_params(&params_def);
 
@@ -531,12 +531,12 @@ void test_edge_cases_new(void)
     search_params_t params_aba = create_literal_params("aba", true, false, false);
     uint64_t aba_bm = test_bridge_boyer_moore(&params_aba, overlap_text, len_overlap, result);
     uint64_t aba_kmp = test_bridge_kmp(&params_aba, overlap_text, len_overlap, result);
-#if KREP_USE_SSE42
-    uint64_t aba_sse = simd_sse42_search(&params_aba, overlap_text, len_overlap, result);
+#if KREP_USE_SSE2
+    uint64_t aba_sse = simd_sse2_search(&params_aba, overlap_text, len_overlap, result);
     printf("  BM: %" PRIu64 ", KMP: %" PRIu64 ", SSE: %" PRIu64 " matches\n",
            aba_bm, aba_kmp, aba_sse);
-    // SSE4.2 (like KMP) should find non-overlapping matches for this specific implementation
-    TEST_ASSERT(aba_sse == 2, "SSE4.2 (fallback) finds 2 occurrences of 'aba'");
+    // SSE2 (like KMP) should find non-overlapping matches for this specific implementation
+    TEST_ASSERT(aba_sse == 2, "SSE2 (fallback) finds 2 occurrences of 'aba'");
 #else
     printf("  BM: %" PRIu64 ", KMP: %" PRIu64 " matches\n", aba_bm, aba_kmp);
 #endif
@@ -549,12 +549,12 @@ void test_edge_cases_new(void)
     search_params_t params_aa = create_literal_params("aa", true, false, false);
     uint64_t aa_count_bm = test_bridge_boyer_moore(&params_aa, aa_text, len_aa, result);
     uint64_t aa_count_kmp = test_bridge_kmp(&params_aa, aa_text, len_aa, result);
-#if KREP_USE_SSE42
-    uint64_t aa_count_sse = simd_sse42_search(&params_aa, aa_text, len_aa, result);
+#if KREP_USE_SSE2
+    uint64_t aa_count_sse = simd_sse2_search(&params_aa, aa_text, len_aa, result);
     printf("BM=%" PRIu64 ", KMP=%" PRIu64 ", SSE=%" PRIu64 "\n",
            aa_count_bm, aa_count_kmp, aa_count_sse);
-    // SSE4.2 (like KMP) should find non-overlapping matches for this specific implementation
-    TEST_ASSERT(aa_count_sse == 2, "SSE4.2 (fallback) finds 2 occurrences of 'aa'");
+    // SSE2 (like KMP) should find non-overlapping matches for this specific implementation
+    TEST_ASSERT(aa_count_sse == 2, "SSE2 (fallback) finds 2 occurrences of 'aa'");
 #else
     printf("BM=%" PRIu64 ", KMP=%" PRIu64 "\n", aa_count_bm, aa_count_kmp);
 #endif
@@ -595,16 +595,16 @@ void test_case_insensitive_new(void)
                 "Case-insensitive finds 'FOX' (KMP)");
     cleanup_params(&params_fox_ci);
 
-#if KREP_USE_SSE42
+#if KREP_USE_SSE2
     search_params_t sse_params_quick_cs = create_literal_params("quick", true, false, false);
-    TEST_ASSERT(simd_sse42_search(&sse_params_quick_cs, haystack, haystack_len, result) == 0,
-                "Case-sensitive doesn't find 'quick' (SSE4.2)");
+    TEST_ASSERT(simd_sse2_search(&sse_params_quick_cs, haystack, haystack_len, result) == 0,
+                "Case-sensitive doesn't find 'quick' (SSE2)");
     cleanup_params(&sse_params_quick_cs);
 
-    // SSE4.2 falls back to Boyer-Moore for case-insensitive
+    // SSE2 falls back to Boyer-Moore for case-insensitive
     search_params_t sse_params_quick_ci = create_literal_params("quick", false, false, false);
-    TEST_ASSERT(simd_sse42_search(&sse_params_quick_ci, haystack, haystack_len, result) == 1,
-                "Case-insensitive finds 'quick' (SSE4.2 Fallback)");
+    TEST_ASSERT(simd_sse2_search(&sse_params_quick_ci, haystack, haystack_len, result) == 1,
+                "Case-insensitive finds 'quick' (SSE2 Fallback)");
     cleanup_params(&sse_params_quick_ci);
 #endif
 }
@@ -740,16 +740,16 @@ void test_performance_new(void)
     TEST_ASSERT(matches_found == expected_matches, "KMP found correct number");
     cleanup_params(&kmp_params);
 
-// --- SSE4.2 (Fallback because pattern length 15 > 16 is false, it's <= 16) ---
-#if KREP_USE_SSE42
+// --- SSE2 (Fallback because pattern length 15 > 16 is false, it's <= 16) ---
+#if KREP_USE_SSE2
     search_params_t sse_params = create_literal_params(pattern, true, false, false);
     start = clock();
-    // SSE4.2 should handle length 15 directly
-    matches_found = simd_sse42_search(&sse_params, large_text, size, result);
+    // SSE2 should handle length 15 directly
+    matches_found = simd_sse2_search(&sse_params, large_text, size, result);
     end = clock();
     time_taken = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf("  SSE4.2 (Direct): %f seconds (found %" PRIu64 " matches)\n", time_taken, matches_found);
-    TEST_ASSERT(matches_found == expected_matches, "SSE4.2 (Direct) found correct number");
+    printf("  SSE2 (Direct): %f seconds (found %" PRIu64 " matches)\n", time_taken, matches_found);
+    TEST_ASSERT(matches_found == expected_matches, "SSE2 (Direct) found correct number");
     cleanup_params(&sse_params);
 #endif
 
@@ -769,7 +769,7 @@ void test_performance_new(void)
     free(large_text);
 }
 
-#if KREP_USE_SSE42 || KREP_USE_AVX2 || KREP_USE_NEON
+#if KREP_USE_SSE2 || KREP_USE_AVX2 || KREP_USE_NEON
 /**
  * Test SIMD specific behaviors using the new structure
  */
@@ -790,61 +790,61 @@ void test_simd_specific_new(void)
     uint64_t matches_bmh;
     uint64_t matches_simd;
 
-#if KREP_USE_SSE42
-    printf("--- Testing SSE4.2 ---\n");
+#if KREP_USE_SSE2
+    printf("--- Testing SSE2 ---\n");
     // Test pattern shorter than SIMD width (5 bytes)
     search_params_t params1 = create_literal_params(pattern1, true, false, false);
-    matches_simd = simd_sse42_search(&params1, haystack, haystack_len, result);
+    matches_simd = simd_sse2_search(&params1, haystack, haystack_len, result);
     matches_bmh = test_bridge_boyer_moore(&params1, haystack, haystack_len, result);
-    TEST_ASSERT(matches_simd == matches_bmh, "SSE4.2 and Boyer-Moore match for 5-byte pattern");
-    TEST_ASSERT(matches_simd == 2, "SSE4.2 finds 'dolor' twice");
+    TEST_ASSERT(matches_simd == matches_bmh, "SSE2 and Boyer-Moore match for 5-byte pattern");
+    TEST_ASSERT(matches_simd == 2, "SSE2 finds 'dolor' twice");
     cleanup_params(&params1);
 
     // Test pattern in middle of SIMD range (11 bytes)
     search_params_t params2 = create_literal_params(pattern2, true, false, false);
-    matches_simd = simd_sse42_search(&params2, haystack, haystack_len, result);
+    matches_simd = simd_sse2_search(&params2, haystack, haystack_len, result);
     matches_bmh = test_bridge_boyer_moore(&params2, haystack, haystack_len, result);
-    TEST_ASSERT(matches_simd == matches_bmh, "SSE4.2 and Boyer-Moore match for 11-byte pattern");
-    TEST_ASSERT(matches_simd == 1, "SSE4.2 finds 'consectetur' once");
+    TEST_ASSERT(matches_simd == matches_bmh, "SSE2 and Boyer-Moore match for 11-byte pattern");
+    TEST_ASSERT(matches_simd == 1, "SSE2 finds 'consectetur' once");
     cleanup_params(&params2);
 
     // Test pattern near SIMD width limit (15 bytes)
     search_params_t params3 = create_literal_params(pattern3, true, false, false);
-    matches_simd = simd_sse42_search(&params3, haystack, haystack_len, result);
+    matches_simd = simd_sse2_search(&params3, haystack, haystack_len, result);
     matches_bmh = test_bridge_boyer_moore(&params3, haystack, haystack_len, result);
-    TEST_ASSERT(matches_simd == matches_bmh, "SSE4.2 and Boyer-Moore match for 15-byte pattern");
-    TEST_ASSERT(matches_simd == 1, "SSE4.2 finds 'adipiscing elit' once");
+    TEST_ASSERT(matches_simd == matches_bmh, "SSE2 and Boyer-Moore match for 15-byte pattern");
+    TEST_ASSERT(matches_simd == 1, "SSE2 finds 'adipiscing elit' once");
     cleanup_params(&params3);
 
     // Test pattern at exactly SIMD width limit (16 bytes)
     search_params_t params16 = create_literal_params(pattern16, true, false, false);
-    matches_simd = simd_sse42_search(&params16, haystack, haystack_len, result);
+    matches_simd = simd_sse2_search(&params16, haystack, haystack_len, result);
     matches_bmh = test_bridge_boyer_moore(&params16, haystack, haystack_len, result);
-    TEST_ASSERT(matches_simd == matches_bmh, "SSE4.2 and Boyer-Moore match for 16-byte pattern");
-    TEST_ASSERT(matches_simd == 1, "SSE4.2 finds 'consectetur adip' once");
+    TEST_ASSERT(matches_simd == matches_bmh, "SSE2 and Boyer-Moore match for 16-byte pattern");
+    TEST_ASSERT(matches_simd == 1, "SSE2 finds 'consectetur adip' once");
     cleanup_params(&params16);
 
     // Test pattern > SIMD width (17 bytes - should fallback)
     search_params_t params17 = create_literal_params(pattern17, true, false, false);
-    matches_simd = simd_sse42_search(&params17, haystack, haystack_len, result); // Will call BM
+    matches_simd = simd_sse2_search(&params17, haystack, haystack_len, result); // Will call BM
     matches_bmh = test_bridge_boyer_moore(&params17, haystack, haystack_len, result);
     TEST_ASSERT(matches_simd == matches_bmh,
-                "SSE4.2 fallback to Boyer-Moore for 17-byte pattern produces same result");
-    TEST_ASSERT(matches_simd == 1, "SSE4.2 fallback finds 'consectetur adipi' once");
+                "SSE2 fallback to Boyer-Moore for 17-byte pattern produces same result");
+    TEST_ASSERT(matches_simd == 1, "SSE2 fallback finds 'consectetur adipi' once");
     cleanup_params(&params17);
 
     // Test case-insensitive SIMD fallback
     const char *pattern_upper = "DOLOR"; // Should match "dolor" and "dolore"
     search_params_t params_ci = create_literal_params(pattern_upper, false, false, false);
-    matches_simd = simd_sse42_search(&params_ci, haystack, haystack_len, result); // Will call BM
+    matches_simd = simd_sse2_search(&params_ci, haystack, haystack_len, result); // Will call BM
     matches_bmh = test_bridge_boyer_moore(&params_ci, haystack, haystack_len, result);
     TEST_ASSERT(matches_simd == matches_bmh,
-                "Case-insensitive search consistent between SSE4.2 fallback and Boyer-Moore");
-    TEST_ASSERT(matches_simd == 2, "Case-insensitive SSE4.2 fallback finds 'DOLOR' twice");
+                "Case-insensitive search consistent between SSE2 fallback and Boyer-Moore");
+    TEST_ASSERT(matches_simd == 2, "Case-insensitive SSE2 fallback finds 'DOLOR' twice");
     cleanup_params(&params_ci);
 #else
-    printf("INFO: SSE4.2 not available, skipping SSE4.2 specific tests.\n");
-#endif // KREP_USE_SSE42
+    printf("INFO: SSE2 not available, skipping SSE2 specific tests.\n");
+#endif // KREP_USE_SSE2
 
 #if KREP_USE_AVX2
     printf("--- Testing AVX2 ---\n");
@@ -928,40 +928,40 @@ void test_report_limit_new(void)
     // Test full length (no limit)
     TEST_ASSERT(test_bridge_boyer_moore(&params, text, full_text_len, result) == 4, "BM counts all 4 with full limit");
     TEST_ASSERT(test_bridge_kmp(&params, text, full_text_len, result) == 4, "KMP counts all 4 with full limit");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params, text, full_text_len, result) == 4, "SSE4.2 counts all 4 with full limit");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params, text, full_text_len, result) == 4, "SSE2 counts all 4 with full limit");
 #endif
 
     // Test limit 18 (should find 3 matches: at 0, 6, 12)
     size_t limit3 = 18;
     TEST_ASSERT(test_bridge_boyer_moore(&params, text, limit3, result) == 3, "BM counts 3 with limit 18");
     TEST_ASSERT(test_bridge_kmp(&params, text, limit3, result) == 3, "KMP counts 3 with limit 18");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params, text, limit3, result) == 3, "SSE4.2 counts 3 with limit 18");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params, text, limit3, result) == 3, "SSE2 counts 3 with limit 18");
 #endif
 
     // Test limit 12 (should find 2 matches: at 0, 6)
     size_t limit2 = 12;
     TEST_ASSERT(test_bridge_boyer_moore(&params, text, limit2, result) == 2, "BM counts 2 with limit 12");
     TEST_ASSERT(test_bridge_kmp(&params, text, limit2, result) == 2, "KMP counts 2 with limit 12");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params, text, limit2, result) == 2, "SSE4.2 counts 2 with limit 12");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params, text, limit2, result) == 2, "SSE2 counts 2 with limit 12");
 #endif
 
     // Test limit 6 (should find 1 match: at 0)
     size_t limit1 = 6;
     TEST_ASSERT(test_bridge_boyer_moore(&params, text, limit1, result) == 1, "BM counts 1 with limit 6");
     TEST_ASSERT(test_bridge_kmp(&params, text, limit1, result) == 1, "KMP counts 1 with limit 6");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params, text, limit1, result) == 1, "SSE4.2 counts 1 with limit 6");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params, text, limit1, result) == 1, "SSE2 counts 1 with limit 6");
 #endif
 
     // Test limit 0 (should find 0 matches)
     size_t limit0 = 0;
     TEST_ASSERT(test_bridge_boyer_moore(&params, text, limit0, result) == 0, "BM counts 0 with limit 0");
     TEST_ASSERT(test_bridge_kmp(&params, text, limit0, result) == 0, "KMP counts 0 with limit 0");
-#if KREP_USE_SSE42
-    TEST_ASSERT(simd_sse42_search(&params, text, limit0, result) == 0, "SSE4.2 counts 0 with limit 0");
+#if KREP_USE_SSE2
+    TEST_ASSERT(simd_sse2_search(&params, text, limit0, result) == 0, "SSE2 counts 0 with limit 0");
 #endif
 
     cleanup_params(&params);
@@ -1614,7 +1614,7 @@ int main(void)
     test_count_lines_multiple_matches();
     test_performance_new();
     test_numeric_patterns_new();
-#if KREP_USE_SSE42 || KREP_USE_AVX2 || KREP_USE_NEON
+#if KREP_USE_SSE2 || KREP_USE_AVX2 || KREP_USE_NEON
     test_simd_specific_new();
 #else
     printf("\nINFO: No SIMD available, skipping SIMD specific tests.\n");
