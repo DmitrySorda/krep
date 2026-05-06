@@ -15,6 +15,11 @@
 #include <stdatomic.h> // For atomic types used in structs
 #include <ctype.h>     // For isalnum function
 
+#ifdef HAVE_PCRE2
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+#endif
+
 // --- Global Variables (declared extern) ---
 extern unsigned char lower_table[256];
 
@@ -84,6 +89,11 @@ typedef struct search_params
 
    // Compiled regex (if applicable, compiled once per file/string)
    const regex_t *compiled_regex;
+
+#ifdef HAVE_PCRE2
+   pcre2_code_8 *compiled_pcre2;     // PCRE2 compiled pattern (JIT-enabled when available)
+   pcre2_match_data_8 *pcre2_match_data; // Reusable match data block (per-thread safe via copy)
+#endif
 
    // Compiled Aho-Corasick trie (if applicable)
    ac_trie_t *ac_trie; // Add pointer for pre-built trie
@@ -214,10 +224,12 @@ uint64_t memchr_short_search(const search_params_t *params, const char *text_sta
 // SIMD functions (only declared if supported by compiler flags)
 #if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64) || defined(__SSE2__)
 uint64_t simd_sse2_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
+uint64_t simd_sse2_caseless_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 
 #if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64) || defined(__AVX2__)
 uint64_t simd_avx2_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
+uint64_t simd_avx2_caseless_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 
 #if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64) || (defined(__AVX512F__) && defined(__AVX512BW__))

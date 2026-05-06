@@ -388,6 +388,13 @@ uint64_t aho_corasick_search(const search_params_t *params,
     const bool track_positions = params->track_positions;
     size_t last_counted_line_start = SIZE_MAX; // Used only if count_lines_mode is true
 
+    // --- Prefilter: build compact 256-byte "first-byte set" for root-skip ----
+    // root_children[256] holds 8-byte pointers — 2 KB, spans many cache lines.
+    // root_fb[256] is 256 bytes (4 cache lines) and stays hot in L1 cache.
+    uint8_t root_fb[256];
+    for (int _ch = 0; _ch < 256; _ch++)
+        root_fb[_ch] = (trie->root_children[_ch] != NULL) ? 1 : 0;
+
     // --- 2. Iterate through the text ---
     for (size_t i = 0; i < text_len; i++)
     {
@@ -395,6 +402,34 @@ uint64_t aho_corasick_search(const search_params_t *params,
         unsigned char c_orig = (unsigned char)text_start[i];
         // Use lower_table for case-insensitive matching during search
         unsigned char c = params->case_sensitive ? c_orig : lower_table[c_orig];
+
+        // --- Root fast-skip: when at root and byte can't start any pattern ---
+        // Burn through non-interesting bytes with a tight loop using the 256-byte table.
+        if (current_node == trie->root && !root_fb[c])
+        {
+            if (params->case_sensitive)
+            {
+                while (i + 1 < text_len)
+                {
+                    i++;
+                    c_orig = (unsigned char)text_start[i];
+                    if (root_fb[c_orig]) { c = c_orig; break; }
+                }
+            }
+            else
+            {
+                while (i + 1 < text_len)
+                {
+                    i++;
+                    c_orig = (unsigned char)text_start[i];
+                    c      = lower_table[c_orig];
+                    if (root_fb[c]) break;
+                }
+            }
+            // If we reached end of text without finding an interesting byte, stop.
+            if (!root_fb[c])
+                break;
+        }
 
         // --- 4. Follow failure links ---
         // Traverse failure links until a node with a transition for 'c' is found,

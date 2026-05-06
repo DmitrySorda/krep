@@ -17,6 +17,16 @@ ifdef NATIVE
     CFLAGS += -mtune=native
 endif
 
+# PCRE2 JIT support: set PCRE2=1 to link against libpcre2-8 and enable the
+# JIT-accelerated regex engine.  Requires libpcre2-dev / brew install pcre2.
+# Example: make PCRE2=1
+ifdef PCRE2
+    PCRE2_CFLAGS := $(shell pkg-config --cflags libpcre2-8 2>/dev/null || echo "-I/usr/local/include")
+    PCRE2_LIBS   := $(shell pkg-config --libs   libpcre2-8 2>/dev/null || echo "-L/usr/local/lib -lpcre2-8")
+    CFLAGS  += -DHAVE_PCRE2 $(PCRE2_CFLAGS)
+    LDFLAGS += $(PCRE2_LIBS)
+endif
+
 # The binary intentionally avoids compile-host SIMD flags such as -mavx2.
 # Runtime dispatch in krep.c selects AVX-512/AVX2/SSE2/NEON when available.
 
