@@ -107,6 +107,7 @@ typedef struct
    const search_params_t *params; // Pointer to shared search parameters
    const char *chunk_start;       // Pointer to the start of the memory chunk for this thread
    size_t chunk_len;              // Length of the chunk to process (may include overlap)
+   size_t owned_len;              // Non-overlapped bytes owned by this chunk
    search_func_t search_algo;     // Pre-selected search algorithm for this chunk
 
    // Thread-specific results
@@ -211,15 +212,15 @@ uint64_t memchr_search(const search_params_t *params, const char *text_start, si
 uint64_t memchr_short_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result); // New function for short patterns
 
 // SIMD functions (only declared if supported by compiler flags)
-#if defined(__SSE4_2__)
-uint64_t simd_sse42_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64) || defined(__SSE2__)
+uint64_t simd_sse2_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 
-#if defined(__AVX2__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64) || defined(__AVX2__)
 uint64_t simd_avx2_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64) || (defined(__AVX512F__) && defined(__AVX512BW__))
 uint64_t simd_avx512_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 #endif
 

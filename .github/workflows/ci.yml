@@ -27,6 +27,9 @@ jobs:
         run: make test
       - name: Run Directory Integration Tests
         run: make test-directory
+      - name: Runtime SIMD dispatch and overlap smoke test
+        shell: bash
+        run: bash test/test_simd_dispatch.sh
       - name: Ensure ripgrep is available
         if: matrix.os == 'ubuntu-latest'
         shell: bash

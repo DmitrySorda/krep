@@ -9,25 +9,37 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <ctype.h> // Include for tolower
 
 #include "krep.h"         // Include main header FIRST for search_params_t definition
 #include "aho_corasick.h" // Include the header defining ac_trie_t forward decl
 
-typedef struct ac_node
+typedef struct ac_node ac_node_t;
+
+typedef struct
 {
-    struct ac_node *children[256]; // Child nodes for each character
-    struct ac_node *fail_link;     // Failure link for state transitions
+    unsigned char ch;
+    ac_node_t *node;
+} ac_edge_t;
+
+struct ac_node
+{
+    ac_edge_t *children;           // Sparse child edges for better cache locality
+    int num_children;
+    int capacity_children;
+    ac_node_t *fail_link;          // Failure link for state transitions
     size_t *output_indices;        // Array of pattern indices ending at this node
     int num_outputs;               // Number of pattern indices ending exactly here
     int capacity_outputs;          // Capacity of the output_indices array
-} ac_node_t;
+};
 
 struct ac_trie
 {
-    ac_node_t *root;     // Root node of the trie
-    size_t num_patterns; // Number of patterns in the trie
-    bool case_sensitive; // Whether search is case-sensitive
+    ac_node_t *root;                  // Root node of the trie
+    ac_node_t *root_children[256];    // Dense root cache; all other nodes stay sparse
+    size_t num_patterns;              // Number of patterns in the trie
+    bool case_sensitive;              // Whether search is case-sensitive
 };
 
 // Create a new AC node
@@ -39,16 +51,68 @@ static ac_node_t *ac_node_create()
         perror("Failed to allocate memory for Aho-Corasick node");
         return NULL;
     }
-    // Initialize children array to NULL
-    memset(node->children, 0, sizeof(node->children));
-
-    // Initialize output_indices as NULL (allocated later if needed)
+    node->children = NULL;
+    node->num_children = 0;
+    node->capacity_children = 0;
     node->output_indices = NULL;
     node->num_outputs = 0;
     node->capacity_outputs = 0;
     node->fail_link = NULL;
 
     return node;
+}
+
+static ac_node_t *ac_node_get_child(const ac_node_t *node, unsigned char c)
+{
+    if (!node)
+        return NULL;
+    for (int i = 0; i < node->num_children; ++i)
+    {
+        if (node->children[i].ch == c)
+            return node->children[i].node;
+    }
+    return NULL;
+}
+
+static bool ac_node_set_child(ac_node_t *node, unsigned char c, ac_node_t *child)
+{
+    if (!node || !child)
+        return false;
+
+    for (int i = 0; i < node->num_children; ++i)
+    {
+        if (node->children[i].ch == c)
+        {
+            node->children[i].node = child;
+            return true;
+        }
+    }
+
+    if (node->num_children >= node->capacity_children)
+    {
+        int new_capacity = 4;
+        if (node->capacity_children > 0)
+        {
+            if (node->capacity_children > INT_MAX / 2)
+                return false;
+            new_capacity = node->capacity_children * 2;
+        }
+        if ((size_t)new_capacity > SIZE_MAX / sizeof(ac_edge_t))
+            return false;
+        ac_edge_t *new_children = realloc(node->children, (size_t)new_capacity * sizeof(ac_edge_t));
+        if (!new_children)
+        {
+            perror("Failed to resize Aho-Corasick child edges");
+            return false;
+        }
+        node->children = new_children;
+        node->capacity_children = new_capacity;
+    }
+
+    node->children[node->num_children].ch = c;
+    node->children[node->num_children].node = child;
+    node->num_children++;
+    return true;
 }
 
 // Add pattern index to node outputs
@@ -89,11 +153,11 @@ static void ac_node_free(ac_node_t *node)
         return;
 
     // Recursively free children
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < node->num_children; i++)
     {
-        if (node->children[i])
+        if (node->children[i].node)
         {
-            ac_node_free(node->children[i]);
+            ac_node_free(node->children[i].node);
         }
     }
 
@@ -102,6 +166,7 @@ static void ac_node_free(ac_node_t *node)
     {
         free(node->output_indices);
     }
+    free(node->children);
 
     // Free the node itself
     free(node);
@@ -122,6 +187,7 @@ ac_trie_t *ac_trie_build(const search_params_t *params)
         perror("Failed to allocate Aho-Corasick trie");
         return NULL;
     }
+    memset(trie->root_children, 0, sizeof(trie->root_children));
 
     // Create the root node
     trie->root = ac_node_create();
@@ -161,19 +227,23 @@ ac_trie_t *ac_trie_build(const search_params_t *params)
             unsigned char c = params->case_sensitive ? c_orig : lower_table[c_orig];
 
             // Create child node if it doesn't exist
-            if (!current->children[c])
+            ac_node_t *child = ac_node_get_child(current, c);
+            if (!child)
             {
-                current->children[c] = ac_node_create();
-                if (!current->children[c])
+                child = ac_node_create();
+                if (!child || !ac_node_set_child(current, c, child))
                 {
                     // Handle allocation failure
+                    ac_node_free(child);
                     ac_trie_free(trie);
                     return NULL;
                 }
+                if (current == trie->root)
+                    trie->root_children[c] = child;
             }
 
             // Advance to the child
-            current = current->children[c];
+            current = child;
         }
 
         // Mark this node with the pattern index (used later for output)
@@ -198,12 +268,9 @@ ac_trie_t *ac_trie_build(const search_params_t *params)
     size_t queue_rear = 0;
 
     // Add root's immediate children to the queue and set their failure links to root
-    for (int c_val = 0; c_val < 256; c_val++) // Use c_val to avoid shadowing
+    for (int edge_idx = 0; edge_idx < trie->root->num_children; edge_idx++)
     {
-        unsigned char c = (unsigned char)c_val; // Cast for indexing
-        if (trie->root->children[c])
-        {
-            ac_node_t *child = trie->root->children[c];
+            ac_node_t *child = trie->root->children[edge_idx].node;
             child->fail_link = trie->root; // Direct children fail to root
 
             // Enqueue
@@ -221,7 +288,6 @@ ac_trie_t *ac_trie_build(const search_params_t *params)
                 queue = new_queue;
             }
             queue[queue_rear++] = child;
-        }
     }
 
     // BFS to build failure links
@@ -230,12 +296,10 @@ ac_trie_t *ac_trie_build(const search_params_t *params)
         ac_node_t *current = queue[queue_front++]; // Dequeue
 
         // Process each child of current node
-        for (int c_val = 0; c_val < 256; c_val++) // Use c_val to avoid shadowing
+        for (int edge_idx = 0; edge_idx < current->num_children; edge_idx++)
         {
-            unsigned char c = (unsigned char)c_val; // Cast to unsigned char for indexing
-            if (current->children[c])
-            {
-                ac_node_t *child = current->children[c];
+                unsigned char c = current->children[edge_idx].ch;
+                ac_node_t *child = current->children[edge_idx].node;
 
                 // Enqueue child
                 if (queue_rear >= queue_capacity)
@@ -255,14 +319,14 @@ ac_trie_t *ac_trie_build(const search_params_t *params)
 
                 // Find failure link for this child
                 ac_node_t *failure = current->fail_link;
-                while (failure != trie->root && !failure->children[c])
+                while (failure != trie->root && !ac_node_get_child(failure, c))
                 {
                     failure = failure->fail_link;
                 }
 
                 // Set the failure link
-                child->fail_link = failure->children[c] ? failure->children[c] : trie->root;
-            }
+                ac_node_t *failure_child = (failure == trie->root) ? trie->root_children[c] : ac_node_get_child(failure, c);
+                child->fail_link = failure_child ? failure_child : trie->root;
         }
     }
 
@@ -335,7 +399,7 @@ uint64_t aho_corasick_search(const search_params_t *params,
         // --- 4. Follow failure links ---
         // Traverse failure links until a node with a transition for 'c' is found,
         // or until the root node is reached.
-        while (current_node != trie->root && !current_node->children[c])
+        while (current_node != trie->root && !ac_node_get_child(current_node, c))
         {
             current_node = current_node->fail_link;
         }
@@ -343,9 +407,10 @@ uint64_t aho_corasick_search(const search_params_t *params,
         // --- 5. Make state transition ---
         // If a transition for 'c' exists from the current node (or a node reached via failure links),
         // move to that child node. Otherwise, stay at the root.
-        if (current_node->children[c])
+        ac_node_t *next_node = (current_node == trie->root) ? trie->root_children[c] : ac_node_get_child(current_node, c);
+        if (next_node)
         {
-            current_node = current_node->children[c];
+            current_node = next_node;
         }
         // If no transition exists even from the root, current_node remains root for the next character.
 

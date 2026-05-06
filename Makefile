@@ -10,43 +10,15 @@ CFLAGS = -Wall -Wextra -O3 -std=c11 -pthread -D_GNU_SOURCE -D_DEFAULT_SOURCE \
          -flto -funroll-loops -finline-functions
 LDFLAGS = -pthread -flto
 
-# Build mode: set NATIVE=1 for maximum performance on local machine
+# Build mode: set NATIVE=1 for local tuning only. SIMD code paths are compiled
+# with per-function target attributes and selected at runtime.
 # Example: make NATIVE=1
 ifdef NATIVE
-    CFLAGS += -march=native -mtune=native
+    CFLAGS += -mtune=native
 endif
 
-# Detect architecture for SIMD flags
-ARCH := $(shell uname -m)
-
-ifeq ($(ARCH), x86_64)
-    # Check for AVX-512 support (Linux: /proc/cpuinfo, macOS: sysctl)
-    HAS_AVX512 := $(shell (grep -q avx512f /proc/cpuinfo 2>/dev/null && echo 1) || \
-                          (sysctl -n machdep.cpu.features 2>/dev/null | grep -q AVX512F && echo 1) || \
-                          echo 0)
-    # Check for AVX2 support
-    HAS_AVX2 := $(shell (grep -q avx2 /proc/cpuinfo 2>/dev/null && echo 1) || \
-                        (sysctl -n machdep.cpu.features 2>/dev/null | grep -q AVX2 && echo 1) || \
-                        (sysctl -n machdep.cpu.leaf7_features 2>/dev/null | grep -q AVX2 && echo 1) || \
-                        echo 0)
-    
-    # Enable the best available SIMD instruction set
-    ifeq ($(HAS_AVX512), 1)
-        CFLAGS += -mavx512f -mavx512bw -msse4.2 -mavx2
-    else ifeq ($(HAS_AVX2), 1)
-        CFLAGS += -mavx2 -msse4.2
-    else
-        # Fallback to SSE4.2 which is widely supported on x86_64
-        CFLAGS += -msse4.2
-    endif
-else ifeq ($(ARCH), arm64)
-    # Enable NEON for arm64 (Apple Silicon, etc.)
-    CFLAGS += -D__ARM_NEON
-    # Note: GCC might enable NEON automatically on arm64, but explicit flag is safer
-else ifeq ($(ARCH), aarch64)
-    # Enable NEON for aarch64 Linux
-    CFLAGS += -D__ARM_NEON
-endif
+# The binary intentionally avoids compile-host SIMD flags such as -mavx2.
+# Runtime dispatch in krep.c selects AVX-512/AVX2/SSE2/NEON when available.
 
 # Source files
 SRCS = krep.c aho_corasick.c

@@ -97,9 +97,9 @@ static inline uint64_t regex_search_compat(
     return regex_search(&params, text, effective_len, NULL);
 }
 
-/* SIMD SSE4.2 compatibility wrapper */
-#ifdef __SSE4_2__
-static inline uint64_t simd_sse42_search_compat(
+/* SIMD SSE2 compatibility wrapper */
+#ifdef __SSE2__
+static inline uint64_t simd_sse2_search_compat(
     const char *text, size_t text_len,
     const char *pattern, size_t pattern_len,
     bool case_sensitive, size_t report_limit_offset)
@@ -118,7 +118,7 @@ static inline uint64_t simd_sse42_search_compat(
         .compiled_regex = NULL};
 
     // Call the new function signature with the adjusted text length
-    return simd_sse42_search(&params, text, effective_len, NULL);
+    return simd_sse2_search(&params, text, effective_len, NULL);
 }
 #endif
 
