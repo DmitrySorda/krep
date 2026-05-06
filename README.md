@@ -20,7 +20,7 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 
 - **Multiple search algorithms**: Boyer-Moore-Horspool, KMP, Aho-Corasick for optimal performance across different pattern types
 - **Algorithm selection**: Automatic smart selection with optional `--algo` override for fine-tuning
-- **SIMD acceleration**: Uses SSE4.2, AVX2, or NEON instructions when available for blazing-fast searches
+- **SIMD acceleration**: Uses runtime-selected SSE2, AVX2, AVX-512, or NEON instructions when available for blazing-fast searches
 - **Memory-mapped I/O**: Maximizes throughput when processing large files
 - **Multi-threaded search**: Automatically parallelizes searches across available CPU cores
 - **Regex support**: POSIX Extended Regular Expression searching
@@ -77,8 +77,8 @@ The binary will be installed to `/usr/local/bin/krep` by default.
 Override default optimization settings in the Makefile:
 
 ```bash
-# Disable architecture-specific optimizations
-make ENABLE_ARCH_DETECTION=0
+# Tune scalar code for the local machine while keeping runtime SIMD dispatch
+make NATIVE=1
 ```
 
 ## Usage
@@ -188,7 +188,7 @@ Krep automatically selects the optimal search algorithm based on the pattern and
 - **Boyer-Moore-Horspool** for most literal string searches
 - **Knuth-Morris-Pratt (KMP)** for very short patterns and repetitive patterns
 - **memchr optimization** for single-character patterns
-- **SIMD Acceleration** (SSE4.2, AVX2, or NEON) for compatible hardware
+- **SIMD Acceleration** (runtime-selected SSE2, AVX2, AVX-512, or NEON) for compatible hardware
 - **Regex Engine** for regular expression patterns
 - **Aho-Corasick** for efficient multiple pattern matching (auto-selected with multiple `-e` patterns)
 
