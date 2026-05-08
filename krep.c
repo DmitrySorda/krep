@@ -43,6 +43,24 @@ static bool ensure_line_buffer_capacity(char **buffer_ptr, size_t *capacity_ptr,
 // Submit multiple tasks in one lock/unlock roundtrip.
 static bool thread_pool_submit_batch(thread_pool_t *pool, void *(*func)(void *), void **args, int count);
 
+/* memrchr is in glibc but NOT in the macOS SDK (Apple uses BSD libc which
+ * doesn't export it despite Apple's man page claiming it's available).
+ * Provide a fast inline fallback for non-glibc platforms. */
+#ifndef __GLIBC__
+static inline void *krep_memrchr(const void *s, int c, size_t n)
+    __attribute__((unused));
+static inline void *krep_memrchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s + n;
+    unsigned char        uc = (unsigned char)c;
+    while (p-- != (const unsigned char *)s)
+    {
+        if (*p == uc) return (void *)p;
+    }
+    return NULL;
+}
+#endif
+
 // SIMD intrinsics are compiled into per-function targets and selected at runtime.
 #if defined(__x86_64__) || defined(__amd64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -404,33 +422,11 @@ size_t find_line_start(const char *text, size_t max_len, size_t pos)
     if (pos == 0)
         return 0; // Already at the start
 
-// Check if memrchr is likely available (common on Linux/glibc)
-#if defined(_GNU_SOURCE) && !defined(__APPLE__) && !defined(_WIN32) // Crude check, refine if needed
-    // Use memrchr to find the last newline before or at pos-1
-    const char *start_ptr = text;
-    // memrchr searches backwards from text + pos - 1 for 'pos' bytes
-    size_t search_len = pos;
-    void *newline_ptr = memrchr(start_ptr, '\n', search_len);
-
-    if (newline_ptr != NULL)
-    {
-        // Found a newline, the line starts *after* it
-        return (const char *)newline_ptr - start_ptr + 1;
-    }
-    else
-    {
-        // No newline found before pos, so the line starts at the beginning of the text
-        return 0;
-    }
-#else
-    // Fallback to manual loop if memrchr is not available or not detected
+    // Fast backward scan: GCC -O3 auto-vectorises this simple loop.
     size_t current = pos;
     while (current > 0 && text[current - 1] != '\n')
-    {
         current--;
-    }
     return current;
-#endif
 }
 
 // Find the end of the line containing the given position
@@ -481,6 +477,13 @@ static int compare_match_positions(const void *a, const void *b)
     if (pa->end_offset > pb->end_offset)
         return 1;
     return 0;
+}
+
+static int compare_size_t_values(const void *a, const void *b)
+{
+    const size_t av = *(const size_t *)a;
+    const size_t bv = *(const size_t *)b;
+    return (av > bv) - (av < bv);
 }
 
 // Helper function to safely append data to a batch buffer
@@ -1304,6 +1307,197 @@ void prepare_bad_char_table(const unsigned char *pattern, size_t pattern_len, in
 
 
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * Rare-byte prefilter search  (replaces Boyer-Moore-Horspool for long literals)
+ *
+ * Inspired by ripgrep's `memmem` crate / Two-Way algorithm:
+ *   1. Preprocessing: scan pattern and pick the byte with the lowest expected
+ *      frequency in natural text.  Call it `rare_byte` at position `rare_pos`.
+ *   2. Search: use libc memchr (SIMD-accelerated) to jump to the next occurrence
+ *      of `rare_byte` in the text, then verify with memcmp.
+ *
+ * vs Boyer-Moore-Horspool:
+ *   BM checks the LAST byte and shifts by bad-char table → effective skip ≈
+ *   pattern_len / avg_char_occurrences.  For random text that is fine, but for
+ *   patterns where the last byte is common (e.g. ' ') BM degenerates.
+ *
+ *   Rare-byte prefilter picks the RAREST byte → on average much fewer calls to
+ *   memcmp, and the memchr scan itself is handled by AVX2/SSE2 in libc.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* Typical frequency of each byte in ASCII prose text.
+ * Higher → more common.  Used to select the "rarest" byte in a pattern.
+ * Values are rough percentages × 10 (so 130 ≈ 13%).
+ * Non-printable and high bytes default to 0 (very rare). */
+static const uint8_t byte_freq_table[256] = {
+    /* 0x00-0x1f: control chars – rare except LF/TAB */
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  5,  8,  0,  0,  4,  0,  0,
+    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    /* 0x20-0x2f: space and punctuation */
+    150,3,  8,  2,  1,  2,  4,  6,  5,  5,  3,  2,  12, 4,  12, 3,
+    /* 0x30-0x39: digits */
+    25, 20, 18, 17, 16, 16, 15, 14, 14, 14,
+    /* 0x3a-0x40: more punctuation */
+    8,  4,  3,  3,  3,  2,  1,
+    /* 0x41-0x5a: uppercase letters */
+    50, 10, 20, 30, 70, 15, 15, 35, 45, 6,  5,  30, 20, 45, 50, 12,
+    6,  40, 40, 55, 30, 8,  15, 5,  12, 4,
+    /* 0x5b-0x60: brackets etc */
+    3,  2,  3,  2,  2,  1,
+    /* 0x61-0x7a: lowercase letters */
+    80, 15, 30, 40, 130,20, 20, 60, 70, 8,  6,  45, 25, 70, 80, 15,
+    8,  60, 60, 90, 35, 10, 20, 7,  15, 5,
+    /* 0x7b-0x7f */
+    2,  2,  2,  2,  0,
+    /* 0x80-0xff: high bytes – treat as rare */
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+};
+
+HOT_FUNCTION
+uint64_t rare_byte_prefilter_search(const search_params_t *params,
+                                    const char *text_start,
+                                    size_t text_len,
+                                    match_result_t *result)
+{
+    if (UNLIKELY(params->max_count == 0 && (params->count_lines_mode || params->track_positions)))
+        return 0;
+
+    const unsigned char *pat  = (const unsigned char *)params->pattern;
+    const size_t plen         = params->pattern_len;
+    const bool   cs            = params->case_sensitive;
+    const bool   count_lines   = params->count_lines_mode;
+    const bool   track_pos     = params->track_positions;
+    const size_t max_count     = params->max_count;
+
+    if (UNLIKELY(plen == 0 || text_len < plen))
+        return 0;
+
+    /* --- Pick the rarest byte in the pattern -------------------------------- */
+    size_t   rare_pos  = 0;
+    uint16_t rare_freq = 999;
+
+    for (size_t i = 0; i < plen; i++)
+    {
+        unsigned char b = cs ? pat[i] : lower_table[pat[i]];
+        uint16_t f = (uint16_t)byte_freq_table[b];
+        if (!cs)
+        {
+            /* For case-insensitive, consider BOTH case variants' combined frequency */
+            unsigned char ub = (b >= 'a' && b <= 'z') ? (unsigned char)(b - 32) : b;
+            f = (uint16_t)(f + byte_freq_table[ub]);
+        }
+        if (f < rare_freq)
+        {
+            rare_freq = f;
+            rare_pos  = i;
+        }
+    }
+
+    unsigned char rare_byte = cs ? pat[rare_pos] : lower_table[pat[rare_pos]];
+    /* Second rare byte for case-insensitive dual-case scan */
+    unsigned char rare_byte2 = (!cs && rare_byte >= 'a' && rare_byte <= 'z')
+                               ? (unsigned char)(rare_byte - 32) : rare_byte;
+
+    /* --- Search loop -------------------------------------------------------- */
+    const unsigned char *utext      = (const unsigned char *)text_start;
+    const unsigned char *text_end   = utext + text_len;
+    /* Earliest valid start of pattern; latest start = text_end - plen */
+    const unsigned char *scan_start = utext;         /* rare_byte must be at +rare_pos */
+    const unsigned char *scan_end   = text_end - rare_pos; /* exclusive upper bound for rare byte */
+
+    uint64_t count = 0;
+    size_t   last_line_start = SIZE_MAX;
+
+    while (scan_start < scan_end)
+    {
+        /* Fast scan for rare byte */
+        const unsigned char *hit;
+        if (cs || rare_byte == rare_byte2)
+        {
+            hit = memchr(scan_start, (int)rare_byte, (size_t)(scan_end - scan_start));
+        }
+        else
+        {
+            /* Case-insensitive: scan for either case variant, pick earliest */
+            const unsigned char *h1 = memchr(scan_start, (int)rare_byte,  (size_t)(scan_end - scan_start));
+            const unsigned char *h2 = memchr(scan_start, (int)rare_byte2, (size_t)(scan_end - scan_start));
+            if (!h1)      hit = h2;
+            else if (!h2) hit = h1;
+            else          hit = (h1 < h2) ? h1 : h2;
+        }
+        if (!hit)
+            break;
+
+        /* Candidate pattern start */
+        const unsigned char *cand = hit - rare_pos;
+
+        /* Verify full pattern */
+        bool match;
+        if (cs)
+            match = (memcmp(cand, pat, plen) == 0);
+        else
+            match = memory_equals_case_insensitive(cand, pat, plen);
+
+        if (match)
+        {
+            size_t match_start = (size_t)(cand - utext);
+            size_t match_end   = match_start + plen;
+
+            /* Whole-word check */
+            if (params->whole_word &&
+                !is_whole_word_match(text_start, text_len, match_start, match_end))
+            {
+                scan_start = hit + 1;
+                continue;
+            }
+
+            if (count_lines)
+            {
+                size_t ls = find_line_start(text_start, text_len, match_start);
+                if (ls != last_line_start)
+                {
+                    if (count >= max_count) break;
+                    count++;
+                    last_line_start = ls;
+                    /* Skip rest of line to avoid re-counting */
+                    size_t le = find_line_end(text_start, text_len, ls);
+                    size_t next = (le < text_len) ? le + 1 : text_len;
+                    if (next > (size_t)(hit - utext))
+                    {
+                        scan_start = utext + next;
+                        if (scan_start > scan_end) scan_start = scan_end;
+                        continue;
+                    }
+                }
+            }
+            else
+            {
+                if (count >= max_count) break;
+                count++;
+                if (track_pos && result)
+                    match_result_add(result, match_start, match_end);
+                if (count >= max_count) break;
+            }
+
+            /* Advance past this match (non-overlapping) */
+            scan_start = cand + plen - rare_pos;
+        }
+        else
+        {
+            scan_start = hit + 1;
+        }
+    }
+
+    return count;
+}
+
 // Adds positions to 'result' if params->track_positions is true.
 // Enhanced with prefetching for better cache performance
 HOT_FUNCTION
@@ -1506,6 +1700,71 @@ static size_t extract_literal_prefix(const char *pattern, char *out, size_t out_
  * Shorter prefixes produce too many false candidates.
  */
 #define REGEX_PREFILTER_MIN_LEN 3
+
+/*
+ * posix_expand_shortcuts - convert PCRE-style shorthand escapes to POSIX ERE.
+ *
+ * POSIX ERE (regcomp REG_EXTENDED) does NOT recognise \w, \d, \s on macOS/BSD.
+ * This function returns a malloc'd copy of `pat` with all such escapes replaced
+ * by their POSIX named-class equivalents, so regcomp() receives valid input:
+ *
+ *   \w  -> [[:alnum:]_]     \W  -> [^[:alnum:]_]
+ *   \d  -> [[:digit:]]      \D  -> [^[:digit:]]
+ *   \s  -> [[:space:]]      \S  -> [^[:space:]]
+ *
+ * Expansions are performed only OUTSIDE character classes [...].
+ * Other backslash sequences (\b, \n, \1, etc.) are left untouched.
+ * Returns NULL on allocation failure.  Caller must free().
+ */
+static char *posix_expand_shortcuts(const char *pat)
+{
+    if (!pat) return NULL;
+    size_t plen = strlen(pat);
+    /* Worst-case expansion: each \X → 14 chars "[^[:alnum:]_]" */
+    char *out = malloc(plen * 14 + 1);
+    if (!out) return NULL;
+    char *w = out;
+    bool in_class = false;
+
+    for (const char *p = pat; *p; p++) {
+        /* Track bracket depth to avoid expanding inside [...] */
+        if (!in_class && *p == '[') {
+            in_class = true;
+            *w++ = '[';
+            continue;
+        }
+        if (in_class && *p == ']') {
+            in_class = false;
+            *w++ = ']';
+            continue;
+        }
+
+        /* Expand shorthand escapes only outside character classes */
+        if (!in_class && *p == '\\' && *(p + 1)) {
+            const char *repl = NULL;
+            switch (*(p + 1)) {
+            case 'w': repl = "[[:alnum:]_]";  break;
+            case 'W': repl = "[^[:alnum:]_]"; break;
+            case 'd': repl = "[[:digit:]]";   break;
+            case 'D': repl = "[^[:digit:]]";  break;
+            case 's': repl = "[[:space:]]";   break;
+            case 'S': repl = "[^[:space:]]";  break;
+            default:  break;
+            }
+            if (repl) {
+                size_t rlen = strlen(repl);
+                memcpy(w, repl, rlen);
+                w += rlen;
+                p++; /* skip the shorthand letter */
+                continue;
+            }
+        }
+
+        *w++ = *p;
+    }
+    *w = '\0';
+    return out;
+}
 
 uint64_t regex_search(const search_params_t *params,
                       const char *text_start,
@@ -1850,16 +2109,1261 @@ uint64_t regex_search(const search_params_t *params,
     return count;
 }
 
+#define ALT_MAX 32
+
+/* ── Simple regex classifier ──────────────────────────────────────────────────
+ * Recognises patterns of the form:  LITERAL_PREFIX + SIMPLE_SUFFIX
+ * where SIMPLE_SUFFIX is one of:
+ *   [0-9]+  [0-9]*  \d+  \d*  [0-9]{N}  [0-9]{N,M}
+ *   [a-zA-Z]+  [a-z]+  [A-Z]+  [a-zA-Z0-9_]+  \w+  \w*  .+  .*
+ * Only case-sensitive, no anchors, no global alternation.
+ * This lets us avoid PCRE2 for patterns like `req_id=[0-9]+`.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+typedef enum {
+    FSUF_NONE = 0,
+    FSUF_DIGIT_PLUS,    /* [0-9]+ or \d+   */
+    FSUF_DIGIT_STAR,    /* [0-9]* or \d*   */
+    FSUF_DIGIT_N,       /* [0-9]{N}        */
+    FSUF_DIGIT_NM,      /* [0-9]{N,M}      */
+    FSUF_ALPHA_PLUS,    /* [a-z]+ [A-Z]+ [a-zA-Z]+ */
+    FSUF_ALNUM_PLUS,    /* [a-zA-Z0-9_]+ or \w+    */
+    FSUF_ALNUM_STAR,    /* \w*                      */
+    FSUF_DOT_PLUS,      /* .+   */
+    FSUF_DOT_STAR,      /* .*   */
+} fast_suffix_t;
+
+typedef struct {
+    char         prefix[64];
+    size_t       prefix_len;
+    fast_suffix_t suffix;
+    int          suf_min;    /* for DIGIT_N / DIGIT_NM  */
+    int          suf_max;    /* -1 = unbounded           */
+} simple_regex_t;
+
+/* Returns true when the char is a regex meta that cannot appear literally */
+static inline bool is_regex_meta(char c)
+{
+    return c == '.' || c == '*' || c == '+' || c == '?' || c == '[' ||
+           c == '(' || c == ')' || c == '{' || c == '}' || c == '|' ||
+           c == '^' || c == '$' || c == '\\';
+}
+
+static bool try_parse_simple_regex(const char *pat, simple_regex_t *out)
+{
+    if (!pat) return false;
+
+    /* Extract literal prefix: stop at first meta or end */
+    size_t plen = 0;
+    const char *p = pat;
+    while (*p && !is_regex_meta(*p) && plen < sizeof(out->prefix) - 1) {
+        out->prefix[plen++] = *p++;
+    }
+    out->prefix[plen] = '\0';
+    out->prefix_len = plen;
+    out->suf_min = 1;
+    out->suf_max = -1;
+
+    /* If nothing left → pure literal, handled by rare_byte_prefilter_search */
+    if (*p == '\0') { out->suffix = FSUF_NONE; return false; }
+
+    /* Parse the suffix */
+    fast_suffix_t suf = FSUF_NONE;
+
+    /* \d+ \d* \w+ \w* .+ .* */
+    if (p[0] == '\\') {
+        if (p[1] == 'd') {
+            if (p[2] == '+') { suf = FSUF_DIGIT_PLUS; p += 3; }
+            else if (p[2] == '*') { suf = FSUF_DIGIT_STAR; p += 3; }
+            else if (p[2] == '{') {
+                int n = 0, m = -1;
+                const char *q = p + 3;
+                while (*q >= '0' && *q <= '9') n = n*10 + (*q++ - '0');
+                if (*q == '}') { suf = FSUF_DIGIT_N; out->suf_min = n; out->suf_max = n; p = q+1; }
+                else if (*q == ',') {
+                    q++;
+                    if (*q == '}') { suf = FSUF_DIGIT_NM; out->suf_min = n; out->suf_max = -1; p = q+1; }
+                    else {
+                        while (*q >= '0' && *q <= '9') m = (m<0?0:m)*10 + (*q++ - '0');
+                        if (*q == '}') { suf = FSUF_DIGIT_NM; out->suf_min = n; out->suf_max = m; p = q+1; }
+                    }
+                }
+            }
+        } else if (p[1] == 'w') {
+            if (p[2] == '+') { suf = FSUF_ALNUM_PLUS; p += 3; }
+            else if (p[2] == '*') { suf = FSUF_ALNUM_STAR; p += 3; }
+        }
+    }
+    /* [0-9]+  [0-9]*  [0-9]{N,M}  [a-z]+  [A-Z]+  [a-zA-Z]+  [a-zA-Z0-9_]+ */
+    else if (p[0] == '[') {
+        bool digit_cls = false, alpha_cls = false, alnum_cls = false;
+        const char *cls = p + 1;
+        /* recognise exactly [0-9] */
+        if (cls[0]=='0' && cls[1]=='-' && cls[2]=='9' && cls[3]==']')
+            { digit_cls = true; p = cls + 4; }
+        /* [a-z] */
+        else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' && cls[3]==']')
+            { alpha_cls = true; p = cls + 4; }
+        /* [A-Z] */
+        else if (cls[0]=='A' && cls[1]=='-' && cls[2]=='Z' && cls[3]==']')
+            { alpha_cls = true; p = cls + 4; }
+        /* [a-zA-Z] */
+        else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' &&
+                 cls[3]=='A' && cls[4]=='-' && cls[5]=='Z' && cls[6]==']')
+            { alpha_cls = true; p = cls + 7; }
+        /* [a-zA-Z0-9_] */
+        else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' &&
+                 cls[3]=='A' && cls[4]=='-' && cls[5]=='Z' &&
+                 cls[6]=='0' && cls[7]=='-' && cls[8]=='9' &&
+                 cls[9]=='_' && cls[10]==']')
+            { alnum_cls = true; p = cls + 11; }
+        else
+            { return false; } /* complex class */
+
+        if (digit_cls) {
+            if (*p == '+') { suf = FSUF_DIGIT_PLUS; p++; }
+            else if (*p == '*') { suf = FSUF_DIGIT_STAR; p++; }
+            else if (*p == '{') {
+                int n = 0, m = -1;
+                const char *q = p + 1;
+                while (*q >= '0' && *q <= '9') n = n*10 + (*q++ - '0');
+                if (*q == '}') { suf = FSUF_DIGIT_N; out->suf_min = n; out->suf_max = n; p = q+1; }
+                else if (*q == ',') {
+                    q++;
+                    if (*q == '}') { suf = FSUF_DIGIT_NM; out->suf_min = n; out->suf_max = -1; p = q+1; }
+                    else {
+                        while (*q >= '0' && *q <= '9') m = (m<0?0:m)*10 + (*q++ - '0');
+                        if (*q == '}') { suf = FSUF_DIGIT_NM; out->suf_min = n; out->suf_max = m; p = q+1; }
+                    }
+                } else { return false; }
+            } else { return false; }
+        } else if (alpha_cls) {
+            if (*p == '+') { suf = FSUF_ALPHA_PLUS; p++; }
+            else { return false; }
+        } else if (alnum_cls) {
+            if (*p == '+') { suf = FSUF_ALNUM_PLUS; p++; }
+            else { return false; }
+        }
+    }
+    /* .+ .* */
+    else if (p[0] == '.') {
+        if (p[1] == '+') { suf = FSUF_DOT_PLUS; p += 2; }
+        else if (p[1] == '*') { suf = FSUF_DOT_STAR; p += 2; }
+        else { return false; }
+    }
+    else { return false; }
+
+    if (suf == FSUF_NONE) return false;
+
+    /* Accept only if nothing follows the suffix (or optional $ anchor) */
+    if (*p == '$') p++;
+    if (*p != '\0') return false; /* trailing junk */
+
+    out->suffix = suf;
+    return true;
+}
+
+/* ── Verify suffix at text pointer ───────────────────────────────────────── */
+static inline size_t verify_fast_suffix(const simple_regex_t *sr,
+                                         const unsigned char *p,
+                                         const unsigned char *end)
+{
+    size_t n = 0;
+    switch (sr->suffix) {
+    case FSUF_DIGIT_PLUS:
+        while (p + n < end && (p[n] >= '0' && p[n] <= '9')) n++;
+        return (n >= 1) ? n : 0;
+    case FSUF_DIGIT_STAR:
+        while (p + n < end && (p[n] >= '0' && p[n] <= '9')) n++;
+        return n; /* zero is ok */
+    case FSUF_DIGIT_N:
+        for (int i = 0; i < sr->suf_min; i++) {
+            if (p + i >= end || !(p[i] >= '0' && p[i] <= '9')) return 0;
+        }
+        return (size_t)sr->suf_min;
+    case FSUF_DIGIT_NM: {
+        while (p + n < end && (p[n] >= '0' && p[n] <= '9')) {
+            n++;
+            if (sr->suf_max > 0 && (int)n >= sr->suf_max) break;
+        }
+        return ((int)n >= sr->suf_min) ? n : 0;
+    }
+    case FSUF_ALPHA_PLUS:
+        while (p + n < end && (((p[n]|32) >= 'a') && ((p[n]|32) <= 'z'))) n++;
+        return (n >= 1) ? n : 0;
+    case FSUF_ALNUM_PLUS:
+    case FSUF_ALNUM_STAR:
+        while (p + n < end && (isalnum(p[n]) || p[n] == '_')) n++;
+        return (sr->suffix == FSUF_ALNUM_STAR || n >= 1) ? n : 0;
+    case FSUF_DOT_PLUS:
+        while (p + n < end && p[n] != '\n') n++;
+        return (n >= 1) ? n : 0;
+    case FSUF_DOT_STAR:
+        while (p + n < end && p[n] != '\n') n++;
+        return n;
+    default: return 0;
+    }
+}
+
+/* ── Fixed-width pattern fast path ───────────────────────────────────────────
+ * Handles patterns like [0-9]{4}-[0-9]{2}-[0-9]{2} that have a known total
+ * width. Parses the pattern into a slot array, picks the rarest literal byte
+ * as anchor, then uses memchr + per-slot verification — no PCRE2 needed.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+#define FWPAT_MAX 64  /* max fixed-width pattern length */
+
+typedef enum {
+    FSLOT_LIT  = 0,  /* exact byte          */
+    FSLOT_DIGIT,     /* [0-9]               */
+    FSLOT_LOWER,     /* [a-z]               */
+    FSLOT_UPPER,     /* [A-Z]               */
+    FSLOT_ALPHA,     /* [a-zA-Z]            */
+    FSLOT_ALNUM,     /* [a-zA-Z0-9_]        */
+    FSLOT_ANY_NL,    /* . (non-newline)     */
+} fslot_type_t;
+
+typedef struct { fslot_type_t type; unsigned char byte; } fslot_t;
+
+typedef struct {
+    fslot_t       slots[FWPAT_MAX];
+    size_t        width;       /* total fixed width                  */
+    size_t        anchor_pos;  /* slot position of rarest literal    */
+    unsigned char anchor_byte;
+    bool          has_anchor;  /* at least one literal slot          */
+} fixed_pattern_t;
+
+/* Append `count` copies of a slot — returns false if overflow */
+static bool fwpat_push(fixed_pattern_t *fp, fslot_type_t type,
+                        unsigned char byte, int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (fp->width >= FWPAT_MAX) return false;
+        fp->slots[fp->width].type = type;
+        fp->slots[fp->width].byte = byte;
+        fp->width++;
+    }
+    return true;
+}
+
+/* Parse `{N}` quantifier after a class — fills min/max, returns true */
+static bool parse_brace_quant(const char **pp, int *n_out, int *m_out)
+{
+    const char *p = *pp;
+    if (*p != '{') return false;
+    p++;
+    int n = 0;
+    while (*p >= '0' && *p <= '9') n = n*10 + (*p++ - '0');
+    if (*p == '}') { *n_out = n; *m_out = n; *pp = p+1; return true; }
+    if (*p == ',') {
+        p++;
+        if (*p == '}') { *n_out = n; *m_out = -1; *pp = p+1; return true; }
+        int m = 0;
+        while (*p >= '0' && *p <= '9') m = m*10 + (*p++ - '0');
+        if (*p == '}' && m >= n) { *n_out = n; *m_out = m; *pp = p+1; return true; }
+    }
+    return false;
+}
+
+static bool try_parse_fixed_pattern(const char *pat, fixed_pattern_t *out)
+{
+    if (!pat) return false;
+    out->width = 0;
+    out->has_anchor = false;
+
+    const char *p = pat;
+    while (*p) {
+        if (!is_regex_meta(*p)) {
+            /* Literal byte */
+            if (!fwpat_push(out, FSLOT_LIT, (unsigned char)*p, 1)) return false;
+            p++;
+            continue;
+        }
+        if (*p == '\\') {
+            p++;
+            if (*p == 'd') {
+                p++;
+                /* optional quantifier */
+                int n = 1, m = 1;
+                if (*p == '+' || *p == '*') return false; /* variable width */
+                parse_brace_quant(&p, &n, &m);
+                if (n != m) return false; /* variable width */
+                if (!fwpat_push(out, FSLOT_DIGIT, 0, n)) return false;
+            } else if (*p == 'w') {
+                p++;
+                int n = 1, m = 1;
+                if (*p == '+' || *p == '*') return false;
+                parse_brace_quant(&p, &n, &m);
+                if (n != m) return false;
+                if (!fwpat_push(out, FSLOT_ALNUM, 0, n)) return false;
+            } else { return false; } /* unknown escape */
+            continue;
+        }
+        if (*p == '[') {
+            /* Recognise a set of known classes */
+            const char *cls = p + 1;
+            fslot_type_t ft;
+            size_t cls_skip = 0;
+            /* [0-9] */
+            if (cls[0]=='0' && cls[1]=='-' && cls[2]=='9' && cls[3]==']')
+                { ft = FSLOT_DIGIT; cls_skip = 4; }
+            /* [a-z] */
+            else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' && cls[3]==']')
+                { ft = FSLOT_LOWER; cls_skip = 4; }
+            /* [A-Z] */
+            else if (cls[0]=='A' && cls[1]=='-' && cls[2]=='Z' && cls[3]==']')
+                { ft = FSLOT_UPPER; cls_skip = 4; }
+            /* [a-zA-Z] */
+            else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' &&
+                     cls[3]=='A' && cls[4]=='-' && cls[5]=='Z' && cls[6]==']')
+                { ft = FSLOT_ALPHA; cls_skip = 7; }
+            /* [a-zA-Z0-9_] */
+            else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' &&
+                     cls[3]=='A' && cls[4]=='-' && cls[5]=='Z' &&
+                     cls[6]=='0' && cls[7]=='-' && cls[8]=='9' &&
+                     cls[9]=='_' && cls[10]==']')
+                { ft = FSLOT_ALNUM; cls_skip = 11; }
+            else { return false; }
+
+            p = cls + cls_skip; /* now at quantifier or next char */
+            int n = 1, m = 1;
+            if (*p == '+' || *p == '*') return false; /* variable */
+            if (*p == '?') return false;
+            if (*p == '{') {
+                if (!parse_brace_quant(&p, &n, &m)) return false;
+                if (n != m) return false; /* variable width */
+            }
+            if (!fwpat_push(out, ft, 0, n)) return false;
+            continue;
+        }
+        if (*p == '.') {
+            p++;
+            int n = 1, m = 1;
+            if (*p == '+' || *p == '*' || *p == '?') return false;
+            if (*p == '{') {
+                if (!parse_brace_quant(&p, &n, &m)) return false;
+                if (n != m) return false;
+            }
+            if (!fwpat_push(out, FSLOT_ANY_NL, 0, n)) return false;
+            continue;
+        }
+        /* Any other meta: give up */
+        return false;
+    }
+
+    if (out->width == 0 || out->width > FWPAT_MAX) return false;
+
+    /* Find rarest literal anchor */
+    uint16_t best_freq = 999;
+    out->anchor_pos = 0;
+    out->anchor_byte = 0;
+    out->has_anchor = false;
+    for (size_t i = 0; i < out->width; i++) {
+        if (out->slots[i].type == FSLOT_LIT) {
+            uint16_t f = byte_freq_table[out->slots[i].byte];
+            if (!out->has_anchor || f < best_freq) {
+                best_freq = f;
+                out->anchor_pos = i;
+                out->anchor_byte = out->slots[i].byte;
+                out->has_anchor = true;
+            }
+        }
+    }
+
+    /* For purely-digit / no-anchor patterns, use middle digit as anchor-less scan — skip */
+    if (!out->has_anchor) return false;
+    return true;
+}
+
+static inline bool fwpat_verify(const fixed_pattern_t *fp,
+                                  const unsigned char *cand,
+                                  const unsigned char *text_end)
+{
+    if (cand + fp->width > text_end) return false;
+    for (size_t i = 0; i < fp->width; i++) {
+        unsigned char b = cand[i];
+        switch (fp->slots[i].type) {
+        case FSLOT_LIT:    if (b != fp->slots[i].byte) return false; break;
+        case FSLOT_DIGIT:  if (b < '0' || b > '9')    return false; break;
+        case FSLOT_LOWER:  if (b < 'a' || b > 'z')    return false; break;
+        case FSLOT_UPPER:  if (b < 'A' || b > 'Z')    return false; break;
+        case FSLOT_ALPHA:  if (!((b|32) >= 'a' && (b|32) <= 'z')) return false; break;
+        case FSLOT_ALNUM:  if (!isalnum(b) && b != '_') return false; break;
+        case FSLOT_ANY_NL: if (b == '\n') return false; break;
+        }
+    }
+    return true;
+}
+
+HOT_FUNCTION
+static uint64_t fixed_width_regex_search(const search_params_t *params,
+                                          const char *text_start,
+                                          size_t text_len,
+                                          match_result_t *result)
+{
+    fixed_pattern_t fp;
+    if (!try_parse_fixed_pattern(params->pattern, &fp)) return 0;
+
+    const unsigned char *utext    = (const unsigned char *)text_start;
+    const unsigned char *text_end  = utext + text_len;
+    bool count_lines = params->count_lines_mode;
+    bool track_pos   = params->track_positions;
+    bool whole_word  = params->whole_word;
+    size_t max_count = params->max_count;
+    uint64_t count = 0;
+    size_t last_line_start = SIZE_MAX;
+
+    /* Scan anchor byte; candidate start is hit - anchor_pos */
+    const unsigned char *scan = utext;
+
+    while (count < max_count) {
+        size_t rem = (size_t)(text_end - scan);
+        if (rem < fp.width) break;
+        /* anchor must not be before utext + anchor_pos */
+        const unsigned char *scan_anchor = scan + fp.anchor_pos;
+        if (scan_anchor >= text_end) break;
+        const unsigned char *h = (const unsigned char *)memchr(
+            scan_anchor, fp.anchor_byte, (size_t)(text_end - scan_anchor));
+        if (!h) break;
+
+        const unsigned char *cand = h - fp.anchor_pos;
+        scan = cand + 1; /* advance past this candidate */
+
+        if (!fwpat_verify(&fp, cand, text_end)) continue;
+
+        size_t match_start = (size_t)(cand - utext);
+        size_t match_end   = match_start + fp.width;
+
+        if (whole_word && !is_whole_word_match(text_start, text_len, match_start, match_end))
+            continue;
+
+        if (count_lines) {
+            size_t ls = find_line_start(text_start, text_len, match_start);
+            if (ls != last_line_start) {
+                count++;
+                last_line_start = ls;
+                size_t le = find_line_end(text_start, text_len, ls);
+                size_t next = (le < text_len) ? le + 1 : text_len;
+                scan = utext + next;
+            }
+        } else {
+            count++;
+            if (track_pos && result) match_result_add(result, match_start, match_end);
+        }
+    }
+    return count;
+}
+
+/* ── simple_regex_search: literal prefix + fast suffix, no PCRE2 ──────────── */
+HOT_FUNCTION
+static uint64_t simple_regex_search(const search_params_t *params,
+                                     const char *text_start,
+                                     size_t text_len,
+                                     match_result_t *result)
+{
+    simple_regex_t sr;
+    if (!try_parse_simple_regex(params->pattern, &sr)) return 0;
+
+    const unsigned char *utext   = (const unsigned char *)text_start;
+    const unsigned char *text_end = utext + text_len;
+
+    bool count_lines = params->count_lines_mode;
+    bool track_pos   = params->track_positions;
+    bool whole_word  = params->whole_word;
+    size_t max_count = params->max_count;
+    uint64_t count   = 0;
+    size_t last_line_start = SIZE_MAX;
+
+    /* If prefix is empty, we can only handle DOT_PLUS/DOT_STAR usefully as
+     * line scanner — but that's a rare case.  Require prefix >= 1. */
+    if (sr.prefix_len == 0) return 0;
+
+    /* Pick rarest byte in prefix for memchr skip */
+    size_t rare_pos = 0;
+    uint16_t rare_freq = 999;
+    for (size_t i = 0; i < sr.prefix_len; i++) {
+        uint16_t f = byte_freq_table[(unsigned char)sr.prefix[i]];
+        if (f < rare_freq) { rare_freq = f; rare_pos = i; }
+    }
+    unsigned char rare_byte = (unsigned char)sr.prefix[rare_pos];
+
+    const unsigned char *scan = utext;
+
+    while (count < max_count) {
+        /* Fast scan for rare byte in prefix */
+        size_t rem = (size_t)(text_end - scan);
+        if (rare_pos > 0 && rem <= rare_pos) break;
+        const unsigned char *h = (const unsigned char *)memchr(scan, rare_byte,
+                                                                (size_t)(text_end - scan));
+        if (!h) break;
+
+        /* Candidate prefix start */
+        if ((size_t)(h - utext) < rare_pos) { scan = h + 1; continue; }
+        const unsigned char *cand = h - rare_pos;
+
+        /* Advance scan past this candidate */
+        scan = cand + 1;
+
+        /* Verify literal prefix */
+        if (cand + sr.prefix_len > text_end) continue;
+        if (memcmp(cand, sr.prefix, sr.prefix_len) != 0) continue;
+
+        /* Verify suffix */
+        const unsigned char *suf_start = cand + sr.prefix_len;
+        size_t suf_len = verify_fast_suffix(&sr, suf_start, text_end);
+        if (suf_len == 0 && sr.suffix != FSUF_DIGIT_STAR && sr.suffix != FSUF_ALNUM_STAR &&
+            sr.suffix != FSUF_DOT_STAR) continue;
+
+        size_t match_start = (size_t)(cand - utext);
+        size_t match_end   = match_start + sr.prefix_len + suf_len;
+
+        /* Whole-word check */
+        if (whole_word && !is_whole_word_match(text_start, text_len, match_start, match_end))
+            continue;
+
+        if (count_lines) {
+            size_t ls = find_line_start(text_start, text_len, match_start);
+            if (ls != last_line_start) {
+                count++;
+                last_line_start = ls;
+                size_t le = find_line_end(text_start, text_len, ls);
+                size_t next = (le < text_len) ? le + 1 : text_len;
+                scan = utext + next;
+            }
+        } else {
+            count++;
+            if (track_pos && result) match_result_add(result, match_start, match_end);
+        }
+    }
+    return count;
+}
+
+typedef enum {
+    CPLUS_DIGIT = 0,
+    CPLUS_LOWER,
+    CPLUS_UPPER,
+    CPLUS_ALPHA,
+    CPLUS_ALNUM,
+    CPLUS_ANY_NL,
+} class_plus_type_t;
+
+typedef struct {
+    class_plus_type_t type;
+    char              suffix[64];
+    size_t            suffix_len;
+    bool              anchor_end;
+} class_suffix_regex_t;
+
+static inline bool class_plus_matches(class_plus_type_t type, unsigned char b)
+{
+    switch (type) {
+    case CPLUS_DIGIT:  return b >= '0' && b <= '9';
+    case CPLUS_LOWER:  return b >= 'a' && b <= 'z';
+    case CPLUS_UPPER:  return b >= 'A' && b <= 'Z';
+    case CPLUS_ALPHA:  return ((b | 32) >= 'a') && ((b | 32) <= 'z');
+    case CPLUS_ALNUM:  return isalnum(b) || b == '_';
+    case CPLUS_ANY_NL: return b != '\n';
+    }
+    return false;
+}
+
+static bool try_parse_class_suffix_regex(const char *pat, class_suffix_regex_t *out)
+{
+    if (!pat || !out) return false;
+
+    const char *p = pat;
+    class_plus_type_t type;
+
+    if (p[0] == '\\') {
+        if (p[1] == 'd' && p[2] == '+') { type = CPLUS_DIGIT; p += 3; }
+        else if (p[1] == 'w' && p[2] == '+') { type = CPLUS_ALNUM; p += 3; }
+        else { return false; }
+    } else if (p[0] == '.' && p[1] == '+') {
+        type = CPLUS_ANY_NL;
+        p += 2;
+    } else if (p[0] == '[') {
+        const char *cls = p + 1;
+        if (cls[0]=='0' && cls[1]=='-' && cls[2]=='9' && cls[3]==']')
+            { type = CPLUS_DIGIT; p = cls + 4; }
+        else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' && cls[3]==']')
+            { type = CPLUS_LOWER; p = cls + 4; }
+        else if (cls[0]=='A' && cls[1]=='-' && cls[2]=='Z' && cls[3]==']')
+            { type = CPLUS_UPPER; p = cls + 4; }
+        else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' &&
+                 cls[3]=='A' && cls[4]=='-' && cls[5]=='Z' && cls[6]==']')
+            { type = CPLUS_ALPHA; p = cls + 7; }
+        else if (cls[0]=='a' && cls[1]=='-' && cls[2]=='z' &&
+                 cls[3]=='A' && cls[4]=='-' && cls[5]=='Z' &&
+                 cls[6]=='0' && cls[7]=='-' && cls[8]=='9' &&
+                 cls[9]=='_' && cls[10]==']')
+            { type = CPLUS_ALNUM; p = cls + 11; }
+        else { return false; }
+
+        if (*p != '+') return false;
+        p++;
+    } else {
+        return false;
+    }
+
+    size_t suffix_len = 0;
+    bool anchor_end = false;
+    while (*p) {
+        if (*p == '$' && p[1] == '\0') {
+            anchor_end = true;
+            p++;
+            break;
+        }
+        if (*p == '\\') {
+            p++;
+            if (!*p) return false;
+            if (*p == 'd' || *p == 'D' || *p == 'w' || *p == 'W' ||
+                *p == 's' || *p == 'S' || *p == 'b' || *p == 'B' ||
+                *p == 'p' || *p == 'P') return false;
+        } else if (is_regex_meta(*p)) {
+            return false;
+        }
+        if (suffix_len >= sizeof(out->suffix) - 1) return false;
+        out->suffix[suffix_len++] = *p++;
+    }
+
+    if (suffix_len == 0) return false;
+    out->suffix[suffix_len] = '\0';
+    out->suffix_len = suffix_len;
+    out->type = type;
+    out->anchor_end = anchor_end;
+    return true;
+}
+
+HOT_FUNCTION
+static uint64_t class_suffix_regex_search(const search_params_t *params,
+                                           const char *text_start,
+                                           size_t text_len,
+                                           match_result_t *result)
+{
+    class_suffix_regex_t csr;
+    if (!try_parse_class_suffix_regex(params->pattern, &csr)) return 0;
+    if (text_len <= csr.suffix_len) return 0;
+
+    const unsigned char *utext = (const unsigned char *)text_start;
+    const unsigned char *text_end = utext + text_len;
+    const unsigned char *suffix = (const unsigned char *)csr.suffix;
+
+    size_t rare_pos = 0;
+    uint16_t rare_freq = 999;
+    for (size_t i = 0; i < csr.suffix_len; i++) {
+        uint16_t f = byte_freq_table[suffix[i]];
+        if (f < rare_freq) { rare_freq = f; rare_pos = i; }
+    }
+
+    const unsigned char rare_byte = suffix[rare_pos];
+    const unsigned char *scan = utext + rare_pos;
+    uint64_t count = 0;
+    size_t last_line_start = SIZE_MAX;
+
+    while (scan < text_end && count < params->max_count) {
+        const unsigned char *hit = memchr(scan, rare_byte, (size_t)(text_end - scan));
+        if (!hit) break;
+        if ((size_t)(hit - utext) < rare_pos) { scan = hit + 1; continue; }
+
+        const unsigned char *suffix_start = hit - rare_pos;
+        scan = hit + 1;
+        if (suffix_start + csr.suffix_len > text_end) continue;
+        if (memcmp(suffix_start, suffix, csr.suffix_len) != 0) continue;
+        if (csr.anchor_end) {
+            const unsigned char *after = suffix_start + csr.suffix_len;
+            if (after < text_end && *after != '\n') continue;
+        }
+        if (suffix_start == utext) continue;
+
+        const unsigned char *match_start_ptr = suffix_start;
+        while (match_start_ptr > utext &&
+               class_plus_matches(csr.type, match_start_ptr[-1])) {
+            match_start_ptr--;
+        }
+        if (match_start_ptr == suffix_start) continue;
+
+        size_t match_start = (size_t)(match_start_ptr - utext);
+        size_t match_end = (size_t)(suffix_start - utext) + csr.suffix_len;
+
+        if (params->whole_word &&
+            !is_whole_word_match(text_start, text_len, match_start, match_end))
+            continue;
+
+        if (params->count_lines_mode) {
+            size_t ls = find_line_start(text_start, text_len, match_start);
+            if (ls != last_line_start) {
+                count++;
+                last_line_start = ls;
+                size_t le = find_line_end(text_start, text_len, ls);
+                size_t next = (le < text_len) ? le + 1 : text_len;
+                scan = utext + next;
+            }
+        } else {
+            count++;
+            if (params->track_positions && result)
+                match_result_add(result, match_start, match_end);
+        }
+    }
+    return count;
+}
+
+typedef struct {
+    char   literal[128];
+    size_t literal_len;
+} surrounding_words_regex_t;
+
+static inline bool regex_ascii_word(unsigned char b)
+{
+    return isalnum(b) || b == '_';
+}
+
+static inline bool regex_inline_space(unsigned char b)
+{
+    return b == ' ' || b == '\t' || b == '\r' || b == '\f' || b == '\v';
+}
+
+static bool try_parse_surrounding_words_regex(const char *pat,
+                                               surrounding_words_regex_t *out)
+{
+    static const char prefix[] = "\\w+\\s+";
+    static const char suffix[] = "\\s+\\w+";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const size_t suffix_len = sizeof(suffix) - 1;
+
+    if (!pat || !out) return false;
+    size_t plen = strlen(pat);
+    if (plen <= prefix_len + suffix_len) return false;
+    if (strncmp(pat, prefix, prefix_len) != 0) return false;
+    if (strcmp(pat + plen - suffix_len, suffix) != 0) return false;
+
+    size_t literal_len = plen - prefix_len - suffix_len;
+    if (literal_len == 0 || literal_len >= sizeof(out->literal)) return false;
+
+    const char *lit = pat + prefix_len;
+    for (size_t i = 0; i < literal_len; i++) {
+        unsigned char c = (unsigned char)lit[i];
+        if (c < 0x80 && is_regex_meta((char)c)) return false;
+    }
+
+    memcpy(out->literal, lit, literal_len);
+    out->literal[literal_len] = '\0';
+    out->literal_len = literal_len;
+    return true;
+}
+
+HOT_FUNCTION
+static uint64_t surrounding_words_regex_search(const search_params_t *params,
+                                                const char *text_start,
+                                                size_t text_len,
+                                                match_result_t *result)
+{
+    surrounding_words_regex_t sw;
+    if (!try_parse_surrounding_words_regex(params->pattern, &sw)) return 0;
+    if (text_len < sw.literal_len + 2) return 0;
+
+    const unsigned char *utext = (const unsigned char *)text_start;
+    const unsigned char *text_end = utext + text_len;
+    const unsigned char *literal = (const unsigned char *)sw.literal;
+
+    size_t rare_pos = 0;
+    uint16_t rare_freq = 999;
+    for (size_t i = 0; i < sw.literal_len; i++) {
+        uint16_t f = byte_freq_table[literal[i]];
+        if (f < rare_freq) { rare_freq = f; rare_pos = i; }
+    }
+
+    uint64_t count = 0;
+    size_t last_line_start = SIZE_MAX;
+    size_t candidate_min = 0;
+
+    while (candidate_min + rare_pos < text_len && count < params->max_count) {
+        const unsigned char *scan = utext + candidate_min + rare_pos;
+        const unsigned char *hit = memchr(scan, literal[rare_pos], (size_t)(text_end - scan));
+        if (!hit) break;
+        if ((size_t)(hit - utext) < rare_pos) { candidate_min++; continue; }
+
+        const unsigned char *lit_start = hit - rare_pos;
+        size_t lit_off = (size_t)(lit_start - utext);
+        candidate_min = lit_off + 1;
+        if (lit_start + sw.literal_len > text_end) break;
+        if (memcmp(lit_start, literal, sw.literal_len) != 0) continue;
+
+        if (lit_start == utext || !regex_inline_space(lit_start[-1])) continue;
+        const unsigned char *left_space_start = lit_start;
+        while (left_space_start > utext && regex_inline_space(left_space_start[-1]))
+            left_space_start--;
+        if (left_space_start == lit_start) continue;
+
+        const unsigned char *left_word_start = left_space_start;
+        while (left_word_start > utext && regex_ascii_word(left_word_start[-1]))
+            left_word_start--;
+        if (left_word_start == left_space_start) continue;
+
+        const unsigned char *right = lit_start + sw.literal_len;
+        if (right >= text_end || !regex_inline_space(*right)) continue;
+        while (right < text_end && regex_inline_space(*right)) right++;
+
+        const unsigned char *right_word_start = right;
+        while (right < text_end && regex_ascii_word(*right)) right++;
+        if (right == right_word_start) continue;
+
+        size_t match_start = (size_t)(left_word_start - utext);
+        size_t match_end = (size_t)(right - utext);
+
+        if (params->whole_word &&
+            !is_whole_word_match(text_start, text_len, match_start, match_end))
+            continue;
+
+        if (params->count_lines_mode) {
+            size_t ls = find_line_start(text_start, text_len, match_start);
+            if (ls != last_line_start) {
+                count++;
+                last_line_start = ls;
+                size_t le = find_line_end(text_start, text_len, ls);
+                candidate_min = (le < text_len) ? le + 1 : text_len;
+            }
+        } else {
+            count++;
+            if (params->track_positions && result)
+                match_result_add(result, match_start, match_end);
+            candidate_min = match_end;
+        }
+    }
+
+    return count;
+}
+
+/* ── try_extract_alternation_literals ────────────────────────────────────────
+ * Decompose a regex pattern of the form (LIT1|LIT2|...) into literal strings.
+ * Returns count of extracted literals (0 on failure). Caller frees lits/lens.
+ * ─────────────────────────────────────────────────────────────────────────── */
+static int try_extract_alternation_literals(const char *pattern,
+                                             char ***lits_out,
+                                             size_t **lens_out)
+{
+    if (!pattern) return 0;
+
+    /* Strip outer parens: (A|B) → A|B */
+    const char *p = pattern;
+    size_t plen = strlen(p);
+    if (plen >= 2 && p[0] == '(' && p[plen-1] == ')') {
+        p++;
+        plen -= 2;
+    }
+
+    if (!memchr(p, '|', plen)) return 0;
+
+    /* Validate: no unescaped ASCII regex metacharacters inside alternatives.
+     * High bytes are UTF-8 literal bytes and are safe to pass through. */
+    for (size_t i = 0; i < plen; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c == '|') continue;
+        if (c < 0x80 && is_regex_meta((char)c)) return 0;
+    }
+
+    int nalts = 1;
+    for (size_t i = 0; i < plen; i++)
+        if (p[i] == '|') nalts++;
+
+    if (nalts < 2 || nalts > ALT_MAX) return 0;
+
+    char **lits = malloc((size_t)nalts * sizeof(char *));
+    size_t *lens = malloc((size_t)nalts * sizeof(size_t));
+    if (!lits || !lens) { free(lits); free(lens); return 0; }
+
+    int idx = 0;
+    const char *start = p;
+    const char *end = p + plen;
+    for (const char *cur = p; cur <= end && idx < nalts; cur++) {
+        if (cur == end || *cur == '|') {
+            size_t len = (size_t)(cur - start);
+            if (len == 0) {
+                for (int j = 0; j < idx; j++) free(lits[j]);
+                free(lits); free(lens); return 0;
+            }
+            lits[idx] = malloc(len + 1);
+            if (!lits[idx]) {
+                for (int j = 0; j < idx; j++) free(lits[j]);
+                free(lits); free(lens); return 0;
+            }
+            memcpy(lits[idx], start, len);
+            lits[idx][len] = '\0';
+            lens[idx] = len;
+            idx++;
+            start = cur + 1;
+        }
+    }
+
+    *lits_out = lits;
+    *lens_out = lens;
+    return idx;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * alternation_literal_search: fast scanner for pure literal alternations
+ * like (ERROR|CRITICAL), (INFO|WARN|DEBUG), etc.
+ *
+ * Strategy (mirrors ripgrep's multi-literal prefilter):
+ *  1. For each alternative, pick its rarest byte.
+ *  2. Main loop: for each alternative, use memchr to find next candidate;
+ *     take the earliest hit, verify the full literal.
+ * This is faster than Aho-Corasick because memchr uses SIMD internally and
+ * we avoid automaton transitions on every byte.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+HOT_FUNCTION
+static uint64_t alternation_literal_search(const char **pats,
+                                            const size_t *plens,
+                                            int npats,
+                                            const char *text_start,
+                                            size_t text_len,
+                                            bool case_sensitive,
+                                            bool count_lines,
+                                            bool whole_word,
+                                            size_t max_count,
+                                            bool track_pos,
+                                            match_result_t *result)
+{
+    if (npats <= 0 || text_len == 0) return 0;
+
+    /* For each pattern: precompute (rare_byte, rare_pos) */
+    unsigned char rare_byte[ALT_MAX];
+    unsigned char rare_byte2[ALT_MAX];
+    size_t        rare_pos[ALT_MAX];
+    size_t        scan_ptr[ALT_MAX]; /* current scan offset per pattern */
+
+    for (int k = 0; k < npats; k++) {
+        size_t best_pos = 0;
+        uint16_t best_freq = 999;
+        const unsigned char *p = (const unsigned char *)pats[k];
+        for (size_t i = 0; i < plens[k]; i++) {
+            unsigned char b = case_sensitive ? p[i] : lower_table[p[i]];
+            uint16_t f = byte_freq_table[b];
+            if (!case_sensitive && b >= 'a' && b <= 'z')
+                f = (uint16_t)(f + byte_freq_table[(unsigned char)(b - 32)]);
+            if (f < best_freq) { best_freq = f; best_pos = i; }
+        }
+        rare_byte[k] = case_sensitive ? p[best_pos] : lower_table[p[best_pos]];
+        rare_byte2[k] = (!case_sensitive && rare_byte[k] >= 'a' && rare_byte[k] <= 'z')
+                        ? (unsigned char)(rare_byte[k] - 32) : rare_byte[k];
+        rare_pos[k]  = best_pos;
+        scan_ptr[k]  = 0;
+    }
+
+    const unsigned char *utext   = (const unsigned char *)text_start;
+    const unsigned char *text_end = utext + text_len;
+    uint64_t count = 0;
+    size_t   last_line_start = SIZE_MAX;
+
+    if (count_lines && !track_pos && max_count == SIZE_MAX) {
+        size_t line_cap = 1024;
+        size_t line_count = 0;
+        size_t *line_starts = malloc(line_cap * sizeof(size_t));
+        bool failed = (line_starts == NULL);
+
+        for (int k = 0; k < npats && !failed; k++) {
+            size_t plen = plens[k];
+            if (plen > text_len || rare_pos[k] >= text_len) continue;
+            const unsigned char *scan_anchor = utext + rare_pos[k];
+            size_t last_line_for_pat = SIZE_MAX;
+
+            while (scan_anchor < text_end) {
+                size_t rem = (size_t)(text_end - scan_anchor);
+                const unsigned char *h;
+                if (case_sensitive || rare_byte[k] == rare_byte2[k]) {
+                    h = (const unsigned char *)memchr(scan_anchor, rare_byte[k], rem);
+                } else {
+                    const unsigned char *h1 = (const unsigned char *)memchr(scan_anchor, rare_byte[k], rem);
+                    const unsigned char *h2 = (const unsigned char *)memchr(scan_anchor, rare_byte2[k], rem);
+                    if (!h1) h = h2;
+                    else if (!h2) h = h1;
+                    else h = (h1 < h2) ? h1 : h2;
+                }
+                if (!h) break;
+                if ((size_t)(h - utext) < rare_pos[k]) { scan_anchor = h + 1; continue; }
+
+                const unsigned char *cand = h - rare_pos[k];
+                scan_anchor = h + 1;
+                if (cand + plen > text_end) break;
+
+                bool match;
+                if (case_sensitive)
+                    match = (memcmp(cand, (const unsigned char *)pats[k], plen) == 0);
+                else
+                    match = memory_equals_case_insensitive(cand, (const unsigned char *)pats[k], plen);
+                if (!match) continue;
+
+                size_t match_start = (size_t)(cand - utext);
+                size_t match_end = match_start + plen;
+                if (whole_word && !is_whole_word_match(text_start, text_len, match_start, match_end))
+                    continue;
+
+                size_t ls = find_line_start(text_start, text_len, match_start);
+                if (ls != last_line_for_pat) {
+                    if (line_count == line_cap) {
+                        if (line_cap > SIZE_MAX / (2 * sizeof(size_t))) { failed = true; break; }
+                        size_t new_cap = line_cap * 2;
+                        size_t *new_lines = realloc(line_starts, new_cap * sizeof(size_t));
+                        if (!new_lines) { failed = true; break; }
+                        line_starts = new_lines;
+                        line_cap = new_cap;
+                    }
+                    line_starts[line_count++] = ls;
+                    last_line_for_pat = ls;
+                }
+
+                size_t le = find_line_end(text_start, text_len, ls);
+                size_t next = (le < text_len) ? le + 1 : text_len;
+                if (next + rare_pos[k] >= text_len) break;
+                scan_anchor = utext + next + rare_pos[k];
+            }
+        }
+
+        if (!failed) {
+            if (line_count == 0) { free(line_starts); return 0; }
+            qsort(line_starts, line_count, sizeof(size_t), compare_size_t_values);
+            count = 1;
+            for (size_t i = 1; i < line_count; i++) {
+                if (line_starts[i] != line_starts[i - 1]) count++;
+            }
+            free(line_starts);
+            return count;
+        }
+        free(line_starts);
+        count = 0;
+    }
+
+    while (count < max_count) {
+        /* Find earliest candidate across all patterns */
+        const unsigned char *best_hit = NULL;
+        int best_k = -1;
+
+        for (int k = 0; k < npats; k++) {
+            size_t plen = plens[k];
+            if (scan_ptr[k] + rare_pos[k] >= text_len) continue;
+            const unsigned char *scan_from = utext + scan_ptr[k] + rare_pos[k];
+            size_t rem = (size_t)(text_end - scan_from);
+            const unsigned char *h;
+            if (case_sensitive || rare_byte[k] == rare_byte2[k]) {
+                h = (const unsigned char *)memchr(scan_from, rare_byte[k], rem);
+            } else {
+                const unsigned char *h1 = (const unsigned char *)memchr(scan_from, rare_byte[k], rem);
+                const unsigned char *h2 = (const unsigned char *)memchr(scan_from, rare_byte2[k], rem);
+                if (!h1) h = h2;
+                else if (!h2) h = h1;
+                else h = (h1 < h2) ? h1 : h2;
+            }
+            if (!h) { scan_ptr[k] = text_len; continue; }
+            /* Candidate start is h - rare_pos[k] */
+            if ((size_t)(h - utext) < rare_pos[k]) continue; /* before start */
+            const unsigned char *cand = h - rare_pos[k];
+            if (cand + plen > text_end) { scan_ptr[k] = text_len; continue; }
+            if (!best_hit || cand < best_hit) {
+                best_hit = cand;
+                best_k = k;
+            }
+        }
+        if (best_k < 0) break; /* no more hits */
+
+        size_t plen = plens[best_k];
+        const unsigned char *cand = best_hit;
+
+        /* Advance this pattern's scan cursor past this candidate */
+        scan_ptr[best_k] = (size_t)(cand - utext) + 1;
+
+        /* Verify full literal */
+        if (case_sensitive) {
+            if (memcmp(cand, (const unsigned char *)pats[best_k], plen) != 0) continue;
+        } else {
+            if (!memory_equals_case_insensitive(cand, (const unsigned char *)pats[best_k], plen)) continue;
+        }
+
+        size_t match_start = (size_t)(cand - utext);
+        size_t match_end   = match_start + plen;
+
+        /* Whole-word check */
+        if (whole_word && !is_whole_word_match(text_start, text_len, match_start, match_end))
+            continue;
+
+        if (count_lines) {
+            size_t ls = find_line_start(text_start, text_len, match_start);
+            if (ls != last_line_start) {
+                count++;
+                last_line_start = ls;
+                /* Skip rest of line */
+                size_t le = find_line_end(text_start, text_len, ls);
+                size_t next = (le < text_len) ? le + 1 : text_len;
+                for (int k = 0; k < npats; k++)
+                    if (scan_ptr[k] < next) scan_ptr[k] = next;
+            }
+        } else {
+            count++;
+            if (track_pos && result)
+                match_result_add(result, match_start, match_end);
+        }
+    }
+    return count;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * alternation_search_dispatch: search_func_t-compatible wrapper that
+ * extracts literals from an alternation pattern and calls
+ * alternation_literal_search.  Registered by select_search_algorithm when
+ * the pattern is a pure case-sensitive alternation of literals.
+ * ───────────────────────────────────────────────────────────────────────── */
+HOT_FUNCTION
+static uint64_t alternation_search_dispatch(const search_params_t *params,
+                                             const char *text_start,
+                                             size_t text_len,
+                                             match_result_t *result)
+{
+    char  **alt_lits = NULL;
+    size_t *alt_lens = NULL;
+    int nalt = try_extract_alternation_literals(params->pattern, &alt_lits, &alt_lens);
+    if (nalt <= 0) return 0; /* shouldn't happen */
+
+    uint64_t cnt = alternation_literal_search(
+        (const char **)alt_lits, (const size_t *)alt_lens, nalt,
+        text_start, text_len,
+        params->case_sensitive,
+        params->count_lines_mode, params->whole_word,
+        params->max_count, params->track_positions, result);
+
+    for (int i = 0; i < nalt; i++) free(alt_lits[i]);
+    free(alt_lits); free(alt_lens);
+    return cnt;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────
  * PCRE2 JIT-accelerated regex search
  * Compiled in only when HAVE_PCRE2 is defined (-DHAVE_PCRE2 in Makefile).
  * Uses the PCRE2 JIT compiler to translate the regex to native machine code
  * at pattern-compile time, then runs it 2-5× faster than POSIX regexec.
  *
+ * Enhancement: inner required-char prefilter.
+ * For patterns like `[a-z]+@[a-z]+\.[a-z]{2,}`, the literal `@` must appear
+ * in every match.  We extract the rarest such required character, then use
+ * memchr to skip most of the file before invoking the expensive PCRE2 JIT.
+ * This mirrors ripgrep's InnerLiterals strategy.
+ *
  * The function signature matches search_func_t so it can be plugged into
  * select_search_algorithm() transparently.
  * ───────────────────────────────────────────────────────────────────────── */
+
 #ifdef HAVE_PCRE2
+
+/*
+ * Scan `pattern` for the rarest literal byte that is guaranteed to appear
+ * in every match (i.e., not under * / ? / {0,...} and not inside a top-level
+ * alternation).
+ *
+ * Returns the byte value (0-255) of the rarest required char, or -1 if none.
+ * The `req_off` output parameter receives the approximate pattern offset where
+ * the char was found (used only as a hint, not for precise alignment).
+ */
+static int extract_rarest_required_char(const char *pattern, size_t *req_off_out)
+{
+    if (!pattern) return -1;
+
+    /* Quick pass: detect top-level alternation.  If present, no single char is
+     * globally required across all branches, so skip the prefilter. */
+    {
+        int depth = 0;
+        for (const char *q = pattern; *q; q++)
+        {
+            if (*q == '\\' && *(q + 1)) { q++; continue; }
+            if (*q == '[')
+            {
+                q++;
+                if (*q == '^') q++;
+                if (*q == ']') q++;              /* literal ] as first char in class */
+                while (*q && *q != ']')
+                {
+                    if (*q == '\\' && *(q + 1)) q++;
+                    q++;
+                }
+                continue;
+            }
+            if (*q == '(') depth++;
+            else if (*q == ')') depth--;
+            else if (*q == '|') return -1; /* any alternation → no guaranteed required char */
+        }
+    }
+
+    int   best_char = -1;
+    int   best_freq = 999;
+    size_t best_off  = 0;
+    size_t pat_off   = 0;
+
+    const char *p = pattern;
+    while (*p)
+    {
+        unsigned char c = (unsigned char)*p;
+
+        if (c == '\\')
+        {
+            p++; pat_off++;
+            if (!*p) break;
+            c = (unsigned char)*p;
+            /* Known meta-escapes that don't match a literal byte */
+            if (c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S' ||
+                c == 'b' || c == 'B' || c == 'n' || c == 't' || c == 'r' || c == 'a' ||
+                c == 'f' || c == 'v' || c == 'p' || c == 'P')
+            {
+                p++; pat_off++;
+                continue;
+            }
+            /* Literal escape: check if next token is a zero-min quantifier */
+            const char *peek = p + 1;
+            bool required = (*peek != '*' && *peek != '?' &&
+                             !(*peek == '{' && *(peek + 1) == '0'));
+            if (required)
+            {
+                int f = (int)byte_freq_table[c];
+                if (f < best_freq) { best_freq = f; best_char = (int)c; best_off = pat_off; }
+            }
+            p++; pat_off++;
+            continue;
+        }
+
+        /* Skip character class [...]  entirely */
+        if (c == '[')
+        {
+            p++; pat_off++;
+            if (*p == '^') { p++; pat_off++; }
+            if (*p == ']') { p++; pat_off++; }   /* literal ] */
+            while (*p && *p != ']')
+            {
+                if (*p == '\\' && *(p + 1)) { p++; pat_off++; }
+                p++; pat_off++;
+            }
+            if (*p == ']') { p++; pat_off++; }
+            continue;
+        }
+
+        /* Regex syntax chars – not literal */
+        if (c == '.' || c == '^' || c == '$' || c == '(' || c == ')' ||
+            c == '|' || c == '{' || c == '}' || c == '*' || c == '+' || c == '?')
+        {
+            p++; pat_off++;
+            continue;
+        }
+
+        /* Plain literal byte: required if NOT followed by *, ?, or {0,...} */
+        const char *peek = p + 1;
+        bool required = (*peek != '*' && *peek != '?' &&
+                         !(*peek == '{' && *(peek + 1) == '0'));
+        if (required)
+        {
+            int f = (int)byte_freq_table[c];
+            if (f < best_freq) { best_freq = f; best_char = (int)c; best_off = pat_off; }
+        }
+        p++; pat_off++;
+    }
+
+    if (req_off_out) *req_off_out = best_off;
+    return best_char;
+}
 
 uint64_t pcre2_regex_search(const search_params_t *params,
                             const char *text_start,
@@ -1882,18 +3386,165 @@ uint64_t pcre2_regex_search(const search_params_t *params,
 
     uint64_t count    = 0;
     size_t   max_count = params->max_count;
-    size_t   offset   = 0;
     size_t   last_line = SIZE_MAX; /* for -c dedup */
+
+    /* ── Inner required-char prefilter (case-sensitive only) ──────────────────
+     * For patterns like [a-z]+@[a-z]+\. the literal '@' must appear in every
+     * match.  Use memchr to skip to candidate lines instead of running the JIT
+     * over every byte.  Mirrors ripgrep's InnerLiterals prefilter strategy.
+     * ──────────────────────────────────────────────────────────────────────── */
+    if (params->case_sensitive && params->pattern)
+    {
+        size_t req_off = 0;
+        int req_char = extract_rarest_required_char(params->pattern, &req_off);
+
+        /* Only bother if the char is extremely rare (freq=1 in typical text).
+         * Higher threshold causes false prefiltering on log-file chars like '='(3)
+         * or '#'(2) which may appear on every line.  Only '@'(1), '$'(1), '`'(1)
+         * qualify at this threshold.  Additionally: quick frequency probe on
+         * first 4KB — if char appears > 40 times (1% of 4K), skip prefilter. */
+        size_t probe_len = text_len < 4096 ? text_len : 4096;
+        size_t probe_count = 0;
+        {
+            const char *probe = text_start;
+            size_t rem = probe_len;
+            while (rem > 0) {
+                const char *h = (const char *)memchr(probe, req_char, rem);
+                if (!h) break;
+                probe_count++;
+                size_t adv = (size_t)(h - probe) + 1;
+                probe += adv; rem -= adv;
+            }
+        }
+        if (req_char >= 0 && byte_freq_table[(unsigned char)req_char] < 2
+            && probe_count <= 40)
+        {
+            const char  *scan_base = text_start;
+            size_t       scan_rem  = text_len;
+            size_t       last_line_prefilter = SIZE_MAX;
+
+            while (scan_rem > 0 && count < max_count)
+            {
+                /* Jump to next occurrence of the required char */
+                const char *hit = (const char *)memchr(scan_base, req_char, scan_rem);
+                if (!hit) break;
+
+                /* Find start of the line containing this hit */
+                size_t hit_off = (size_t)(hit - text_start);
+                const char *nl_back = hit_off > 0
+                    ? (const char *)krep_memrchr(text_start, '\n', hit_off) : NULL;
+                const char *line_start = nl_back ? nl_back + 1 : text_start;
+
+                size_t line_offset = (size_t)(line_start - text_start);
+
+                /* Already processed this line from a previous hit → skip */
+                if (line_offset == last_line_prefilter)
+                {
+                    size_t adv = (size_t)(hit - scan_base) + 1;
+                    scan_base += adv;
+                    scan_rem  -= adv;
+                    continue;
+                }
+
+                /* Find end of the line */
+                const char *line_end_ptr = (const char *)memchr(
+                    line_start, '\n', (size_t)((text_start + text_len) - line_start));
+                size_t line_len = line_end_ptr
+                    ? (size_t)(line_end_ptr - line_start)
+                    : (size_t)((text_start + text_len) - line_start);
+
+                /* Run PCRE2 JIT over the entire line */
+                size_t line_abs_start = line_offset;
+                size_t line_abs_end   = line_offset + line_len;
+                size_t lp = line_abs_start;
+                bool   line_counted = false;
+
+                while (lp < line_abs_end && count < max_count)
+                {
+                    /* Limit search to current line only (prevents O(N²) scanning) */
+                    int rc = params->pcre2_jit_ok
+                        ? pcre2_jit_match_8(re,
+                                            (PCRE2_SPTR8)text_start,
+                                            (PCRE2_SIZE)line_abs_end,
+                                            (PCRE2_SIZE)lp,
+                                            0,
+                                            match_data,
+                                            NULL)
+                        : pcre2_match_8(re,
+                                        (PCRE2_SPTR8)text_start,
+                                        (PCRE2_SIZE)line_abs_end,
+                                        (PCRE2_SIZE)lp,
+                                        0,
+                                        match_data,
+                                        NULL);
+
+                    if (rc == PCRE2_ERROR_NOMATCH) break;
+                    if (rc < 0) break;
+
+                    PCRE2_SIZE *ovector = pcre2_get_ovector_pointer_8(match_data);
+                    size_t so = (size_t)ovector[0];
+                    size_t eo = (size_t)ovector[1];
+
+                    if (params->whole_word &&
+                        !is_whole_word_match(text_start, text_len, so, eo))
+                    {
+                        lp = (so == eo) ? eo + 1 : eo;
+                        continue;
+                    }
+
+                    if (params->count_lines_mode)
+                    {
+                        if (!line_counted)
+                        {
+                            count++;
+                            line_counted = true;
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        count++;
+                        if (params->track_positions && result)
+                            match_result_add(result, so, eo);
+                    }
+                    lp = (so == eo) ? eo + 1 : eo;
+                }
+
+                last_line_prefilter = line_offset;
+
+                /* Advance past this line */
+                const char *next = line_end_ptr ? line_end_ptr + 1 : text_start + text_len;
+                scan_rem  = (size_t)((text_start + text_len) - next);
+                scan_base = next;
+            }
+
+            pcre2_match_data_free_8(match_data);
+            return count;
+        }
+    }
+    /* ── End prefilter – fall through to standard full-text scan ─────────── */
+
+    size_t   offset   = 0;
+    /* Use fast pcre2_jit_match_8 (skips sanity checks) when JIT compiled */
+    const bool use_jit_match = params->pcre2_jit_ok;
 
     while (offset <= text_len && count < max_count)
     {
-        int rc = pcre2_match_8(re,
-                               (PCRE2_SPTR8)text_start,
-                               (PCRE2_SIZE)text_len,
-                               (PCRE2_SIZE)offset,
-                               0,
-                               match_data,
-                               NULL);
+        int rc = use_jit_match
+            ? pcre2_jit_match_8(re,
+                                (PCRE2_SPTR8)text_start,
+                                (PCRE2_SIZE)text_len,
+                                (PCRE2_SIZE)offset,
+                                0,
+                                match_data,
+                                NULL)
+            : pcre2_match_8(re,
+                            (PCRE2_SPTR8)text_start,
+                            (PCRE2_SIZE)text_len,
+                            (PCRE2_SIZE)offset,
+                            0,
+                            match_data,
+                            NULL);
 
         if (rc == PCRE2_ERROR_NOMATCH)
             break;
@@ -2145,6 +3796,39 @@ search_func_t select_search_algorithm(const search_params_t *params)
     // Use regex search if requested
     if (params->use_regex)
     {
+        if (params->pattern) {
+            /* Fast path: pure literal alternation like (ERROR|CRITICAL). */
+            char  **alt_lits = NULL;
+            size_t *alt_lens = NULL;
+            int nalt = try_extract_alternation_literals(params->pattern, &alt_lits, &alt_lens);
+            if (nalt > 0) {
+                for (int i = 0; i < nalt; i++) free(alt_lits[i]);
+                free(alt_lits); free(alt_lens);
+                return alternation_search_dispatch;
+            }
+
+            if (params->case_sensitive) {
+                surrounding_words_regex_t sw;
+                if (try_parse_surrounding_words_regex(params->pattern, &sw))
+                    return surrounding_words_regex_search;
+
+                class_suffix_regex_t csr;
+                if (try_parse_class_suffix_regex(params->pattern, &csr))
+                    return class_suffix_regex_search;
+
+                /* Fast path: LITERAL + simple suffix like req_id=[0-9]+.
+                 * Avoids PCRE2 entirely: SIMD prefix scan + inline suffix verifier. */
+                simple_regex_t sr;
+                if (try_parse_simple_regex(params->pattern, &sr) && sr.prefix_len >= 1)
+                    return simple_regex_search;
+
+                /* Fast path: fixed-width pattern like [0-9]{4}-[0-9]{2}-[0-9]{2}.
+                 * Parses into slot array, anchors on rarest literal byte. */
+                fixed_pattern_t fp;
+                if (try_parse_fixed_pattern(params->pattern, &fp))
+                    return fixed_width_regex_search;
+            }
+        }
 #ifdef HAVE_PCRE2
         if (params->compiled_pcre2)
             return pcre2_regex_search;
@@ -2236,6 +3920,14 @@ search_func_t select_search_algorithm(const search_params_t *params)
     if (params->pattern_len < KMP_THRESH && is_repetitive_pattern(params->pattern, params->pattern_len))
     {
         return kmp_search; // KMP is better for repetitive patterns
+    }
+    else if (params->case_sensitive && params->pattern_len > 16)
+    {
+        /* Rare-byte prefilter beats Boyer-Moore-Horspool for longer patterns:
+         * memchr (AVX2-accelerated in libc) + memcmp is far cheaper than
+         * scanning with the BM bad-char table for patterns the SIMD path
+         * cannot handle (>SIMD_MAX_PATTERN_LEN). */
+        return rare_byte_prefilter_search;
     }
     else
     {
@@ -2339,10 +4031,22 @@ const char *get_algorithm_name(search_func_t func)
 {
     if (func == boyer_moore_search)
         return "Boyer-Moore-Horspool";
+    else if (func == rare_byte_prefilter_search)
+        return "rare-byte-prefilter";
     else if (func == kmp_search)
         return "Knuth-Morris-Pratt";
     else if (func == regex_search)
         return "Regex";
+    else if (func == alternation_search_dispatch)
+        return "regex-literal-alternation";
+    else if (func == class_suffix_regex_search)
+        return "regex-class-suffix";
+    else if (func == surrounding_words_regex_search)
+        return "regex-surrounding-words";
+    else if (func == simple_regex_search)
+        return "regex-simple-suffix";
+    else if (func == fixed_width_regex_search)
+        return "regex-fixed-width";
     else if (func == aho_corasick_search)
         return "Aho-Corasick";
     else if (func == memchr_search)
@@ -2528,7 +4232,10 @@ int search_string(const search_params_t *params, const char *text)
 
         // Compile the regex
         int rflags = REG_EXTENDED | REG_NEWLINE | (current_params.case_sensitive ? 0 : REG_ICASE);
-        int ret = regcomp(&compiled_regex_local, regex_to_compile, rflags);
+        /* Expand \w/\d/\s to POSIX named classes for regcomp(); PCRE2 keeps original. */
+        char *posix_pat = posix_expand_shortcuts(regex_to_compile);
+        int ret = regcomp(&compiled_regex_local, posix_pat ? posix_pat : regex_to_compile, rflags);
+        free(posix_pat);
 
         if (ret != 0)
         {
@@ -2556,8 +4263,9 @@ int search_string(const search_params_t *params, const char *text)
                 NULL);
             if (current_params.compiled_pcre2)
             {
-                /* Attempt JIT compilation — ignore if unsupported */
-                pcre2_jit_compile_8(current_params.compiled_pcre2, PCRE2_JIT_COMPLETE);
+                /* Attempt JIT compilation — track success for fast jit_match path */
+                current_params.pcre2_jit_ok =
+                    (pcre2_jit_compile_8(current_params.compiled_pcre2, PCRE2_JIT_COMPLETE) == 0);
             }
         }
 #endif
@@ -2881,7 +4589,8 @@ int search_file(const search_params_t *params, const char *filename, int request
             }
 
             int rflags = REG_EXTENDED | REG_NEWLINE | (current_params.case_sensitive ? 0 : REG_ICASE);
-            if (regcomp(&temp_regex, regex_to_compile, rflags) == 0)
+            char *posix_pat_em = posix_expand_shortcuts(regex_to_compile);
+            if (regcomp(&temp_regex, posix_pat_em ? posix_pat_em : regex_to_compile, rflags) == 0)
             {
                 regmatch_t m;
                 if (regexec(&temp_regex, "", 1, &m, 0) == 0 && m.rm_so == 0 && m.rm_eo == 0)
@@ -2890,6 +4599,7 @@ int search_file(const search_params_t *params, const char *filename, int request
                 }
                 regfree(&temp_regex);
             }
+            free(posix_pat_em);
             free(temp_combined_pattern);
         }
         // Check single literal empty pattern
@@ -3010,7 +4720,10 @@ int search_file(const search_params_t *params, const char *filename, int request
         }
 
         int rflags = REG_EXTENDED | REG_NEWLINE | (current_params.case_sensitive ? 0 : REG_ICASE);
-        int ret = regcomp(&compiled_regex_local, regex_to_compile, rflags);
+        /* Expand \w/\d/\s to POSIX named classes for regcomp(); PCRE2 keeps original. */
+        char *posix_pat_f = posix_expand_shortcuts(regex_to_compile);
+        int ret = regcomp(&compiled_regex_local, posix_pat_f ? posix_pat_f : regex_to_compile, rflags);
+        free(posix_pat_f);
         if (ret != 0)
         {
             char ebuf[256];
@@ -3037,7 +4750,8 @@ int search_file(const search_params_t *params, const char *filename, int request
                 &pcre2_erroff,
                 NULL);
             if (mutable_params.compiled_pcre2)
-                pcre2_jit_compile_8(mutable_params.compiled_pcre2, PCRE2_JIT_COMPLETE);
+                mutable_params.pcre2_jit_ok =
+                    (pcre2_jit_compile_8(mutable_params.compiled_pcre2, PCRE2_JIT_COMPLETE) == 0);
         }
 #endif
         current_params = mutable_params; // Update current_params to use for threads

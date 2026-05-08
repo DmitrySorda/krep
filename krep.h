@@ -93,6 +93,7 @@ typedef struct search_params
 #ifdef HAVE_PCRE2
    pcre2_code_8 *compiled_pcre2;     // PCRE2 compiled pattern (JIT-enabled when available)
    pcre2_match_data_8 *pcre2_match_data; // Reusable match data block (per-thread safe via copy)
+   bool pcre2_jit_ok;                // true if JIT compilation succeeded
 #endif
 
    // Compiled Aho-Corasick trie (if applicable)
@@ -216,6 +217,7 @@ void print_usage(const char *program_name);
 /* --- Internal Search Algorithm Declarations (Updated Signature) --- */
 
 uint64_t boyer_moore_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
+uint64_t rare_byte_prefilter_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 uint64_t kmp_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 uint64_t regex_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
 uint64_t memchr_search(const search_params_t *params, const char *text_start, size_t text_len, match_result_t *result);
