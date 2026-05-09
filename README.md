@@ -231,7 +231,7 @@ All three tools produce byte-identical output (verified with sorted diff)._
 | `the` | 0.132857 | 0.318571 | 4.848571 | 2.40x | 36.49x |
 | `Sherlock` | 0.031429 | 0.080000 | 2.777143 | 2.55x | 88.36x |
 
-_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 2.3.0 improves the hot `-c -F` path by preferring the short literal scalar fast path for 2-3 byte patterns and by splitting multi-threaded count workloads on newline boundaries, eliminating boundary over-count risk while reducing overlap overhead. Results vary by CPU, storage and cache state._
+_Measured on macOS ARM64 with the official `subtitles2016-sample.en` dataset. `krep` 2.4.0 improves the hot `-c -F` path by preferring the short literal scalar fast path for 2-3 byte patterns and by splitting multi-threaded count workloads on newline boundaries, eliminating boundary over-count risk while reducing overlap overhead. Results vary by CPU, storage and cache state._
 
 ## How Krep Works
 
