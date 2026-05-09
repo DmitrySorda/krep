@@ -32,6 +32,7 @@ Just as skilled fishers identify patterns in the water to locate fish quickly, I
 - **Refined terminal UI**: Clearer colors, improved `-o` line index styling, and a redesigned help screen
 - **Specialized algorithms**: Optimized handling for single-character and short patterns
 - **Match Limiting**: Stop searching a file after a specific number of matching lines are found.
+- **LMDB trigram index** *(optional)*: Pre-build a persistent index with `--build-index` and accelerate recursive searches 2–3× with `--use-index` by skipping files before reading them.
 
 ## Recent Improvements
 
@@ -79,7 +80,41 @@ Override default optimization settings in the Makefile:
 ```bash
 # Tune scalar code for the local machine while keeping runtime SIMD dispatch
 make NATIVE=1
+
+# Enable LMDB-backed trigram index (bundles LMDB source, no external dep)
+make LMDB=1
 ```
+
+## Trigram Index (optional)
+
+When built with `LMDB=1`, krep gains two new commands that allow it to skip files
+that cannot possibly contain the search pattern — without reading a single byte of
+their content:
+
+**Step 1 — build or update the index:**
+```bash
+krep --build-index ./src
+# krep-index: done. indexed=412 skipped=0  (src/.krep-index)
+```
+The index lives in a hidden `.krep-index/` subdirectory next to the searched tree.
+It is incremental: re-running only re-indexes files whose `mtime` has changed.
+
+**Step 2 — search with the index:**
+```bash
+krep --use-index -r "PatternName" ./src
+# krep: index: 28 candidate file(s) after trigram filter
+# ... matches ...
+```
+Results are byte-for-byte identical to a plain `krep -r` run; the index is only
+used for pre-filtering.
+
+**Under the hood:**
+- The index stores all 3-character substrings (trigrams) of each file in three
+  LMDB named databases: files → mtime, trigram → file list (DUPSORT), file → trigram
+  blob (reverse map for O(k) deletion).
+- Querying intersects candidate sets across all trigrams of the pattern; only
+  files surviving the intersection are opened and searched.
+- LMDB source is bundled in `lmdb/`—no external library needed.
 
 ## Usage
 
@@ -152,6 +187,10 @@ cat krep.c | krep 'c'
 - `-v, --version` Show version information
 - `-h, --help` Show help message
 
+> **LMDB index flags** (available when built with `make LMDB=1`):
+> - `--build-index DIR` Walk DIR recursively and build/update the trigram index inside `DIR/.krep-index/`
+> - `--use-index` When combined with `-r`, query the trigram index first and search only candidate files
+
 ## Performance Benchmarks
 
 Benchmarks are run with the official dataset:
@@ -167,6 +206,23 @@ You can reproduce the `krep` vs `ripgrep` comparison with:
 make bench-rg
 # optional: RUNS=7 bash test/benchmark_krep_vs_rg.sh Sherlock
 ```
+
+### krep+index vs ripgrep (warm cache, 15 runs median, `ripgrep/crates/` corpus)
+
+| Pattern | Lines | rg -j1 | krep | krep+index | Candidates | krep/rg | idx/rg |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `Searcher` | 334 | 16.6 ms | 11.1 ms | **8.1 ms** | 53/138 | 1.50× | **2.05×** |
+| `haystack` | 347 | 16.7 ms | 11.5 ms | **6.3 ms** | 18/138 | 1.46× | **2.64×** |
+| `fn ` | 2734 | 20.3 ms | 12.1 ms | **9.3 ms** | 79/138 | 1.68× | **2.17×** |
+| `pub fn ` | 414 | 17.4 ms | 11.7 ms | **7.0 ms** | 33/138 | 1.49× | **2.47×** |
+| `impl Matcher` | 5 | 15.9 ms | 11.3 ms | **7.2 ms** | 25/138 | 1.41× | **2.20×** |
+| `use crate` | 70 | 18.1 ms | 11.5 ms | **9.2 ms** | 64/138 | 1.57× | **1.96×** |
+| `struct ` | 293 | 18.2 ms | 11.8 ms | **8.1 ms** | 53/138 | 1.55× | **2.24×** |
+| `error` | 507 | 18.8 ms | 11.9 ms | **9.1 ms** | 65/138 | 1.58× | **2.07×** |
+
+_138 Rust source files, macOS, Python `perf_counter` timing. Candidates = files
+passing trigram pre-filter; the rest are skipped without being opened.
+All three tools produce byte-identical output (verified with sorted diff)._
 
 ### krep vs ripgrep / grep (warm cache, 7 runs average baseline)
 
