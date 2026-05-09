@@ -12,6 +12,9 @@
 
 #include "krep.h"         // Include the header file
 #include "aho_corasick.h" // Include AC header for build/free functions
+#ifdef HAVE_LMDB
+#include "krep_index.h"   // LMDB-backed trigram index
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -5656,6 +5659,10 @@ int main(int argc, char *argv[])
     bool recursive_mode = false;             // Flag for -r (recursive directory search)
     int thread_count = DEFAULT_THREAD_COUNT; // Thread count (0 = auto)
     const char *color_when = "auto";         // Color output control ('auto', 'always', 'never')
+#ifdef HAVE_LMDB
+    bool build_index_mode = false;           // --build-index: build trigram index and exit
+    bool use_index_mode   = false;           // --use-index:   use trigram index to pre-filter
+#endif
 
     // --- getopt_long Setup ---
     struct option long_options[] = {
@@ -5668,6 +5675,10 @@ int main(int argc, char *argv[])
         {"max-count", required_argument, 0, 'm'}, // --max-count=NUM option
         {"gitignore", no_argument, 0, 256},       // --gitignore
         {"algo", required_argument, 0, 257},      // --algo=ALGO
+#ifdef HAVE_LMDB
+        {"build-index", no_argument, 0, 258},     // --build-index: build LMDB trigram index
+        {"use-index",   no_argument, 0, 259},     // --use-index:   search via index
+#endif
         {0, 0, 0, 0}                              // Terminator
     };
     int option_index = 0;
@@ -5881,6 +5892,14 @@ int main(int argc, char *argv[])
                 return 2;
             }
             break;
+#ifdef HAVE_LMDB
+        case 258: // --build-index
+            build_index_mode = true;
+            break;
+        case 259: // --use-index
+            use_index_mode = true;
+            break;
+#endif
         case '?': // Unknown option or missing argument from getopt
         default:  // Should not happen
             print_usage(argv[0]);
@@ -5897,6 +5916,23 @@ int main(int argc, char *argv[])
         color_output_enabled = false;
     else                                              // "auto" (default)
         color_output_enabled = isatty(STDOUT_FILENO); // Enable only if stdout is a TTY
+
+#ifdef HAVE_LMDB
+    // --build-index DIRECTORY: no PATTERN needed — handle early
+    if (build_index_mode)
+    {
+        const char *idx_dir = NULL;
+        if (optind < argc)
+            idx_dir = argv[optind];
+        if (idx_dir == NULL)
+        {
+            fprintf(stderr, "krep: --build-index requires a DIRECTORY argument\n");
+            return 2;
+        }
+        int rc = krep_index_build(idx_dir);
+        return (rc == KRIDX_OK) ? 0 : 2;
+    }
+#endif
 
     // Get pattern argument(s)
     if (num_patterns_found == 0)
@@ -6027,6 +6063,60 @@ int main(int argc, char *argv[])
             return 2;
         }
         atomic_store(&global_match_found_flag, false); // Reset global flag
+
+#ifdef HAVE_LMDB
+        if (use_index_mode && params.num_patterns == 1 && !params.use_regex)
+        {
+            // Try to use LMDB trigram index to pre-filter candidate files
+            krep_index_t *kidx = krep_index_open(target_arg);
+            if (kidx == NULL)
+            {
+                fprintf(stderr, "krep: --use-index: no index found in '%s'. Run --build-index first.\n", target_arg);
+                return 2;
+            }
+
+            char *candidates[KRIDX_MAX_CANDIDATES];
+            bool  unindexed = false;
+            int   ncand = krep_index_query(kidx, params.pattern, params.pattern_len,
+                                           params.case_sensitive,
+                                           candidates, KRIDX_MAX_CANDIDATES, &unindexed);
+            krep_index_close(kidx);
+
+            if (unindexed || ncand < 0)
+            {
+                // Pattern too short or query error — fall back to full scan
+                fprintf(stderr, "krep: index: pattern too short for trigram filtering, falling back to full scan\n");
+                int errors = search_directory_recursive(target_arg, &params, thread_count);
+                exit_code = (errors > 0) ? 2 : (atomic_load(&global_match_found_flag) ? 0 : 1);
+            }
+            else
+            {
+                fprintf(stderr, "krep: index: %d candidate file(s) after trigram filter\n", ncand);
+                int errors = 0;
+                for (int ci = 0; ci < ncand; ci++)
+                {
+                    int fr = search_file(&params, candidates[ci], thread_count);
+                    if (fr == 2) errors++;
+                    free(candidates[ci]);
+                }
+                exit_code = (errors > 0) ? 2 : (atomic_load(&global_match_found_flag) ? 0 : 1);
+            }
+        }
+        else
+        {
+            // Normal recursive search (no index or conditions not met)
+            int errors = search_directory_recursive(target_arg, &params, thread_count);
+            if (errors > 0)
+            {
+                fprintf(stderr, "krep: Encountered %d errors during recursive search.\n", errors);
+                exit_code = 2;
+            }
+            else
+            {
+                exit_code = atomic_load(&global_match_found_flag) ? 0 : 1;
+            }
+        }
+#else
         int errors = search_directory_recursive(target_arg, &params, thread_count);
         if (errors > 0)
         {
@@ -6037,6 +6127,7 @@ int main(int argc, char *argv[])
         {
             exit_code = atomic_load(&global_match_found_flag) ? 0 : 1; // 0 if matches found, 1 otherwise
         }
+#endif
     }
     else
     { // Single target (file or stdin)

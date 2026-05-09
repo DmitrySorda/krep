@@ -32,7 +32,17 @@ endif
 
 # Source files
 SRCS = krep.c aho_corasick.c
-OBJS = $(SRCS:.c=.o)
+LMDB_OBJS =
+
+# LMDB trigram index: set LMDB=1 to compile in the krep_index layer.
+# Uses the bundled LMDB source in lmdb/ (no external dependency required).
+# Example: make LMDB=1
+ifdef LMDB
+    CFLAGS    += -DHAVE_LMDB -Ilmdb
+    LMDB_OBJS  = lmdb/mdb.o lmdb/midl.o krep_index.o
+endif
+
+OBJS = $(SRCS:.c=.o) $(LMDB_OBJS)
 
 # Test source files
 TEST_SRCS = test/test_krep.c test/test_regex.c test/test_multiple_patterns.c
@@ -51,6 +61,16 @@ $(TARGET): $(OBJS)
 
 # Rule for main objects
 %.o: %.c krep.h aho_corasick.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Rule for LMDB and index objects (no krep.h dependency)
+lmdb/mdb.o: lmdb/mdb.c lmdb/lmdb.h lmdb/midl.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lmdb/midl.o: lmdb/midl.c lmdb/midl.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+krep_index.o: krep_index.c krep_index.h lmdb/lmdb.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- Test Build ---
@@ -95,4 +115,4 @@ uninstall:
 
 # --- Cleanup ---
 clean:
-	rm -f $(TARGET) $(TEST_TARGET) $(OBJS) $(TEST_OBJS_MAIN) $(TEST_OBJS_TEST) *.o test/*.o
+	rm -f $(TARGET) $(TEST_TARGET) $(OBJS) $(TEST_OBJS_MAIN) $(TEST_OBJS_TEST) *.o test/*.o lmdb/*.o
