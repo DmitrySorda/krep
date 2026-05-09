@@ -103,7 +103,7 @@ static inline void *krep_memrchr(const void *s, int c, size_t n)
 #define LARGE_FILE_THRESHOLD (64 * 1024 * 1024) // 64MB threshold for advanced optimizations
 #define SINGLE_THREAD_FILE_SIZE_THRESHOLD MIN_CHUNK_SIZE
 #define ADAPTIVE_THREAD_FILE_SIZE_THRESHOLD 0
-#define VERSION "2.3.0"
+#define VERSION "2.4.0"
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
